@@ -11,10 +11,12 @@ import argparse
 import base64
 import datetime as dt
 import getpass
+import hashlib
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import urllib.parse
@@ -56,6 +58,10 @@ SCHEMA_STATUSES = {"unknown", "inferred", "declared", "validated"}
 CONFIDENCE_VALUES = {"high", "medium", "low"}
 VOLATILITY_VALUES = {"hot", "warm", "cold"}
 PERMISSION_DENIED_ERRNOS = {1, 13}
+ADAPTER_PROTOCOL = "llm-wiki-adapter/v1"
+ADAPTER_REGISTRY_SCHEMA = 1
+ADAPTER_MANIFEST_NAME = ".llm-wiki-adapter.json"
+ADAPTER_ARTIFACT_CLASSES = {"wiki-safe", "private", "bulk"}
 
 ROOT_ALLOWED = {
     "_index.md",
@@ -2527,6 +2533,587 @@ def run_retract(args: argparse.Namespace) -> int:
     return 2 if report["status"] == "incomplete" else 0
 
 
+def adapter_config_dir() -> Path:
+    override = os.environ.get("LLM_WIKI_CONFIG_DIR")
+    if override:
+        return expand_leading_tilde(override)
+    return Path.home() / ".config" / "llm-wiki"
+
+
+def adapter_registry_path() -> Path:
+    return adapter_config_dir() / "adapters.json"
+
+
+def empty_adapter_registry() -> dict[str, Any]:
+    return {"schema_version": ADAPTER_REGISTRY_SCHEMA, "adapters": {}}
+
+
+def read_adapter_registry() -> dict[str, Any]:
+    path = adapter_registry_path()
+    if not path.exists():
+        return empty_adapter_registry()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SystemExit(f"could not read adapter registry {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid adapter registry {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit(f"invalid adapter registry {path}: root must be an object")
+    if data.get("schema_version") != ADAPTER_REGISTRY_SCHEMA:
+        raise SystemExit(
+            f"unsupported adapter registry schema in {path}: "
+            f"expected {ADAPTER_REGISTRY_SCHEMA}"
+        )
+    if not isinstance(data.get("adapters"), dict):
+        raise SystemExit(f"invalid adapter registry {path}: adapters must be an object")
+    return data
+
+
+def write_adapter_registry(data: dict[str, Any]) -> None:
+    path = adapter_registry_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    temporary = Path(handle.name)
+    try:
+        json.dump(data, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+        path.chmod(0o600)
+    except Exception:
+        handle.close()
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def write_private_json(path: Path, data: dict[str, Any]) -> None:
+    """Atomically write a machine-local receipt without broadening permissions."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    temporary = Path(handle.name)
+    try:
+        json.dump(data, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+        path.chmod(0o600)
+    except Exception:
+        handle.close()
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_json_object(path: Path, label: str) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SystemExit(f"could not read {label} {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid {label} {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit(f"invalid {label} {path}: root must be an object")
+    return data
+
+
+def validate_adapter_manifest(data: dict[str, Any], path: Path) -> None:
+    errors: list[str] = []
+    adapter_id = data.get("id")
+    if not isinstance(adapter_id, str) or not re.fullmatch(
+        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", adapter_id
+    ):
+        errors.append("id must be a lowercase hyphenated identifier")
+    if data.get("protocol") != ADAPTER_PROTOCOL:
+        errors.append(f"protocol must be {ADAPTER_PROTOCOL!r}")
+    if not isinstance(data.get("version"), str) or not data.get("version"):
+        errors.append("version must be a non-empty string")
+    entrypoint = data.get("entrypoint")
+    if not isinstance(entrypoint, list) or not entrypoint or not all(
+        isinstance(item, str) and item for item in entrypoint
+    ):
+        errors.append("entrypoint must be a non-empty argv array")
+    if data.get("writes_wiki") is not False:
+        errors.append("writes_wiki must be false; adapters cannot write into a wiki")
+    network = data.get("network", "none")
+    if network not in {"none", "optional", "required"}:
+        errors.append("network must be none, optional, or required")
+    capabilities = data.get("capabilities")
+    if not isinstance(capabilities, list) or not capabilities or not all(
+        isinstance(item, str) and item for item in capabilities
+    ):
+        errors.append("capabilities must be a non-empty string array")
+    operations = data.get("operations")
+    if not isinstance(operations, dict) or not operations:
+        errors.append("operations must be a non-empty object")
+    else:
+        for name, operation in operations.items():
+            if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9-]*", name):
+                errors.append("operation names must be lowercase hyphenated identifiers")
+                continue
+            if not isinstance(operation, dict):
+                errors.append(f"operation {name!r} must be an object")
+                continue
+            read_arguments = operation.get("read_arguments", [])
+            if not isinstance(read_arguments, list) or not all(
+                isinstance(item, str) and item for item in read_arguments
+            ):
+                errors.append(f"operation {name!r} read_arguments must be a string array")
+            if not isinstance(operation.get("requires_output_dir", False), bool):
+                errors.append(f"operation {name!r} requires_output_dir must be boolean")
+    output_classes = data.get("output_classes", [])
+    if not isinstance(output_classes, list) or not set(output_classes).issubset(
+        ADAPTER_ARTIFACT_CLASSES
+    ):
+        errors.append(
+            "output_classes must contain only wiki-safe, private, and/or bulk"
+        )
+    if errors:
+        raise SystemExit(
+            f"invalid adapter manifest {path}: " + "; ".join(sorted(set(errors)))
+        )
+
+
+def read_adapter_manifest(root: Path) -> tuple[Path, dict[str, Any]]:
+    path = root / ADAPTER_MANIFEST_NAME
+    if not path.is_file():
+        raise SystemExit(f"adapter manifest not found: {path}")
+    data = load_json_object(path, "adapter manifest")
+    validate_adapter_manifest(data, path)
+    return path, data
+
+
+def normalized_absolute_path(value: str) -> Path:
+    return expand_leading_tilde(value).resolve(strict=False)
+
+
+def resolve_adapter_command(root: Path, entrypoint: list[str]) -> list[str]:
+    command = list(entrypoint)
+    executable = Path(command[0])
+    if executable.is_absolute():
+        command[0] = os.path.abspath(executable)
+    elif "/" in command[0] or command[0].startswith("."):
+        # Do not dereference the final executable symlink. Python virtual
+        # environments rely on being invoked through .venv/bin/python so the
+        # interpreter discovers pyvenv.cfg and its installed dependencies.
+        command[0] = os.path.abspath(root / executable)
+    else:
+        resolved = shutil.which(command[0])
+        if resolved:
+            command[0] = resolved
+    return command
+
+
+def registered_adapter(registry: dict[str, Any], adapter_id: str) -> dict[str, Any]:
+    entry = registry.get("adapters", {}).get(adapter_id)
+    if not isinstance(entry, dict):
+        raise SystemExit(f"adapter is not registered: {adapter_id}")
+    return entry
+
+
+def path_within(path: Path, roots: list[Path]) -> bool:
+    return any(path == root or root in path.parents for root in roots)
+
+
+def adapter_environment(entry: dict[str, Any]) -> dict[str, str]:
+    names = {
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+    }
+    names.update(str(item) for item in entry.get("env_allow", []))
+    environment = {name: os.environ[name] for name in names if name in os.environ}
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PYTHONUTF8"] = "1"
+    environment["LLM_WIKI_ADAPTER_ROOT"] = str(entry["root"])
+    return environment
+
+
+def run_adapter_process(
+    entry: dict[str, Any], arguments: list[str], timeout: int
+) -> subprocess.CompletedProcess[str]:
+    if timeout <= 0:
+        raise SystemExit("adapter timeout must be greater than zero")
+    command = [str(item) for item in entry["command"]] + arguments
+    try:
+        return subprocess.run(
+            command,
+            cwd=str(entry["root"]),
+            env=adapter_environment(entry),
+            text=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SystemExit(f"adapter timed out after {timeout} seconds") from exc
+    except OSError as exc:
+        raise SystemExit(f"could not execute registered adapter: {exc}") from exc
+
+
+def adapter_public_entry(adapter_id: str, entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": adapter_id,
+        "version": entry.get("version"),
+        "capabilities": entry.get("capabilities", []),
+        "distribution": entry.get("distribution", "private"),
+        "network": entry.get("network", "none"),
+        "root": entry.get("root"),
+        "registered_at": entry.get("registered_at"),
+    }
+
+
+def adapter_add(args: argparse.Namespace) -> int:
+    root = normalized_absolute_path(args.path)
+    if not root.is_dir():
+        raise SystemExit(f"adapter root is not a directory: {root}")
+    manifest_path, manifest = read_adapter_manifest(root)
+    adapter_id = str(manifest["id"])
+    registry = read_adapter_registry()
+    if adapter_id in registry["adapters"] and not args.replace:
+        raise SystemExit(
+            f"adapter is already registered: {adapter_id}; use --replace to update it"
+        )
+    read_roots = {root}
+    read_roots.update(normalized_absolute_path(value) for value in args.read_root)
+    write_roots = {
+        normalized_absolute_path(value) for value in args.write_root
+    }
+    command = resolve_adapter_command(root, list(manifest["entrypoint"]))
+    entry = {
+        "root": str(root),
+        "command": command,
+        "version": manifest["version"],
+        "capabilities": manifest["capabilities"],
+        "distribution": manifest.get("distribution", "private"),
+        "network": manifest.get("network", "none"),
+        "read_roots": sorted(str(path) for path in read_roots),
+        "write_roots": sorted(str(path) for path in write_roots),
+        "env_allow": sorted(set(args.env)),
+        "manifest_sha256": file_sha256(manifest_path),
+        "registered_at": today_date().isoformat(),
+    }
+    registry["adapters"][adapter_id] = entry
+    write_adapter_registry(registry)
+    report = adapter_public_entry(adapter_id, entry)
+    report.update(
+        {
+            "status": "registered",
+            "registry": str(adapter_registry_path()),
+            "read_roots": entry["read_roots"],
+            "write_roots": entry["write_roots"],
+        }
+    )
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(f"Registered adapter: {adapter_id} {entry['version']}")
+        print(f"Registry: {adapter_registry_path()}")
+        print("Trust: explicit local registration; no repository was cloned or published.")
+    return 0
+
+
+def adapter_list(args: argparse.Namespace) -> int:
+    registry = read_adapter_registry()
+    entries = [
+        adapter_public_entry(adapter_id, entry)
+        for adapter_id, entry in sorted(registry["adapters"].items())
+        if isinstance(entry, dict)
+    ]
+    if args.json:
+        print(json.dumps({"adapters": entries}, indent=2, sort_keys=True))
+    elif not entries:
+        print("No private adapters registered.")
+    else:
+        for entry in entries:
+            capabilities = ",".join(entry["capabilities"])
+            print(
+                f"{entry['id']}\t{entry['version']}\t{entry['network']}\t"
+                f"{capabilities}\t{entry['root']}"
+            )
+    return 0
+
+
+def adapter_show(args: argparse.Namespace) -> int:
+    registry = read_adapter_registry()
+    entry = registered_adapter(registry, args.adapter_id)
+    report = dict(entry)
+    report["id"] = args.adapter_id
+    report["registry"] = str(adapter_registry_path())
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def adapter_doctor(args: argparse.Namespace) -> int:
+    registry = read_adapter_registry()
+    entry = registered_adapter(registry, args.adapter_id)
+    issues: list[str] = []
+    root = Path(str(entry.get("root", ""))).resolve(strict=False)
+    manifest_path = root / ADAPTER_MANIFEST_NAME
+    manifest: dict[str, Any] | None = None
+    if not root.is_dir():
+        issues.append("registered root is missing")
+    elif not manifest_path.is_file():
+        issues.append("adapter manifest is missing")
+    else:
+        try:
+            manifest = load_json_object(manifest_path, "adapter manifest")
+            validate_adapter_manifest(manifest, manifest_path)
+        except SystemExit as exc:
+            issues.append(str(exc))
+        if file_sha256(manifest_path) != entry.get("manifest_sha256"):
+            issues.append("adapter manifest changed; re-register with --replace")
+    command = entry.get("command")
+    if not isinstance(command, list) or not command:
+        issues.append("registered command is invalid")
+    elif not Path(str(command[0])).is_file():
+        issues.append("registered executable is missing")
+    handshake: dict[str, Any] | None = None
+    if not issues:
+        result = run_adapter_process(entry, ["describe"], args.timeout)
+        if result.returncode != 0:
+            issues.append(f"describe handshake failed with exit {result.returncode}")
+        else:
+            try:
+                parsed = json.loads(result.stdout)
+                handshake = parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                handshake = None
+            if handshake is None:
+                issues.append("describe handshake did not return one JSON object")
+            else:
+                for field in ("protocol", "id", "version", "capabilities"):
+                    if manifest is not None and handshake.get(field) != manifest.get(field):
+                        issues.append(f"describe handshake disagrees on {field}")
+    report = {
+        "id": args.adapter_id,
+        "status": "healthy" if not issues else "unhealthy",
+        "issues": issues,
+        "root": str(root),
+        "protocol": ADAPTER_PROTOCOL,
+        "handshake": handshake,
+    }
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(f"Adapter {args.adapter_id}: {report['status']}")
+        for issue in issues:
+            print(f"- {issue}")
+    return 0 if not issues else 1
+
+
+def validate_adapter_request(
+    request: dict[str, Any], adapter_id: str, manifest: dict[str, Any], entry: dict[str, Any]
+) -> tuple[str, Path | None]:
+    if request.get("protocol") != ADAPTER_PROTOCOL:
+        raise SystemExit(f"request protocol must be {ADAPTER_PROTOCOL!r}")
+    if request.get("adapter_id") != adapter_id:
+        raise SystemExit(f"request adapter_id must be {adapter_id!r}")
+    operation = request.get("operation")
+    operations = manifest["operations"]
+    if not isinstance(operation, str) or operation not in operations:
+        raise SystemExit(f"request operation is not supported by {adapter_id}")
+    arguments = request.get("arguments")
+    if not isinstance(arguments, dict):
+        raise SystemExit("request arguments must be an object")
+    if not isinstance(request.get("options", {}), dict):
+        raise SystemExit("request options must be an object")
+    read_roots = [Path(value).resolve(strict=False) for value in entry["read_roots"]]
+    operation_spec = operations[operation]
+    for name in operation_spec.get("read_arguments", []):
+        raw_path = arguments.get(name)
+        if not isinstance(raw_path, str) or not raw_path:
+            raise SystemExit(f"request argument {name!r} must be an absolute path")
+        path = Path(raw_path)
+        if not path.is_absolute():
+            raise SystemExit(f"request argument {name!r} must be an absolute path")
+        resolved = path.resolve(strict=False)
+        if not resolved.exists():
+            raise SystemExit(f"request argument {name!r} does not exist")
+        if not path_within(resolved, read_roots):
+            raise SystemExit(f"request argument {name!r} is outside registered read roots")
+    output_dir: Path | None = None
+    if operation_spec.get("requires_output_dir", False):
+        raw_output = request.get("output_dir")
+        if not isinstance(raw_output, str) or not raw_output:
+            raise SystemExit("request output_dir must be an absolute path")
+        candidate = Path(raw_output)
+        if not candidate.is_absolute():
+            raise SystemExit("request output_dir must be an absolute path")
+        output_dir = candidate.resolve(strict=False)
+        write_roots = [Path(value).resolve(strict=False) for value in entry["write_roots"]]
+        if not write_roots or not path_within(output_dir, write_roots):
+            raise SystemExit("request output_dir is outside registered write roots")
+    return operation, output_dir
+
+
+def validate_adapter_response(
+    response: dict[str, Any], adapter_id: str, operation: str,
+    manifest: dict[str, Any], entry: dict[str, Any], output_dir: Path | None
+) -> None:
+    if response.get("protocol") != ADAPTER_PROTOCOL:
+        raise SystemExit("adapter response has the wrong protocol")
+    if response.get("adapter_id") != adapter_id:
+        raise SystemExit("adapter response has the wrong adapter_id")
+    if response.get("operation") != operation:
+        raise SystemExit("adapter response has the wrong operation")
+    if response.get("adapter_version") != manifest.get("version"):
+        raise SystemExit("adapter response has the wrong adapter_version")
+    if response.get("status") not in {"ok", "error"}:
+        raise SystemExit("adapter response status must be ok or error")
+    if not isinstance(response.get("summary"), dict):
+        raise SystemExit("adapter response summary must be an object")
+    if response["status"] == "ok" and not isinstance(response.get("run_id"), str):
+        raise SystemExit("successful adapter response run_id must be a string")
+    if response["status"] == "error":
+        errors = response.get("errors")
+        if not isinstance(errors, list) or not errors or not all(
+            isinstance(item, str) and item for item in errors
+        ):
+            raise SystemExit("failed adapter response errors must be a non-empty string array")
+    artifacts = response.get("artifacts", [])
+    if not isinstance(artifacts, list):
+        raise SystemExit("adapter response artifacts must be an array")
+    allowed_classes = set(manifest.get("output_classes", []))
+    write_roots = [Path(value).resolve(strict=False) for value in entry["write_roots"]]
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            raise SystemExit("adapter response artifact must be an object")
+        raw_path = artifact.get("path")
+        artifact_class = artifact.get("class")
+        expected_sha = artifact.get("sha256")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise SystemExit("adapter response artifact path is missing")
+        if artifact_class not in allowed_classes:
+            raise SystemExit("adapter response artifact has an undeclared class")
+        if not isinstance(expected_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+            raise SystemExit("adapter response artifact sha256 is invalid")
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            if output_dir is None:
+                raise SystemExit("relative adapter artifact requires output_dir")
+            candidate = output_dir / candidate
+        resolved = candidate.resolve(strict=False)
+        if not resolved.is_file():
+            raise SystemExit("adapter response artifact does not exist as a file")
+        if not path_within(resolved, write_roots):
+            raise SystemExit("adapter response artifact is outside registered write roots")
+        if output_dir is not None and not path_within(resolved, [output_dir]):
+            raise SystemExit("adapter response artifact is outside the request output_dir")
+        if file_sha256(resolved) != expected_sha:
+            raise SystemExit("adapter response artifact sha256 does not match")
+
+
+def adapter_run(args: argparse.Namespace) -> int:
+    registry = read_adapter_registry()
+    entry = registered_adapter(registry, args.adapter_id)
+    root = Path(entry["root"]).resolve(strict=False)
+    manifest_path, manifest = read_adapter_manifest(root)
+    if file_sha256(manifest_path) != entry.get("manifest_sha256"):
+        raise SystemExit("adapter manifest changed; re-register with --replace")
+    request_path = normalized_absolute_path(args.request)
+    request = load_json_object(request_path, "adapter request")
+    operation, output_dir = validate_adapter_request(
+        request, args.adapter_id, manifest, entry
+    )
+    with tempfile.TemporaryDirectory(prefix="llm-wiki-adapter-") as temporary:
+        response_path = Path(temporary) / "response.json"
+        result = run_adapter_process(
+            entry,
+            ["execute", "--request", str(request_path), "--response", str(response_path)],
+            args.timeout,
+        )
+        if not response_path.is_file():
+            raise SystemExit(
+                f"adapter exited {result.returncode} without a response document"
+            )
+        response = load_json_object(response_path, "adapter response")
+    validate_adapter_response(
+        response, args.adapter_id, operation, manifest, entry, output_dir
+    )
+    if args.response:
+        destination = normalized_absolute_path(args.response)
+        write_private_json(destination, response)
+    if args.json:
+        print(json.dumps(response, indent=2, sort_keys=True))
+    else:
+        print(
+            f"Adapter {args.adapter_id} {operation}: {response['status']} "
+            f"({len(response.get('artifacts', []))} verified artifacts)"
+        )
+        print("No artifacts were imported into the wiki automatically.")
+    if result.returncode != 0 or response["status"] != "ok":
+        return 2
+    return 0
+
+
+def adapter_remove(args: argparse.Namespace) -> int:
+    registry = read_adapter_registry()
+    registered_adapter(registry, args.adapter_id)
+    if not args.yes:
+        raise SystemExit("adapter remove requires --yes")
+    del registry["adapters"][args.adapter_id]
+    write_adapter_registry(registry)
+    report = {"id": args.adapter_id, "status": "removed"}
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(f"Removed adapter registration: {args.adapter_id}")
+    return 0
+
+
+def run_adapter(args: argparse.Namespace) -> int:
+    handlers = {
+        "add": adapter_add,
+        "list": adapter_list,
+        "show": adapter_show,
+        "doctor": adapter_doctor,
+        "run": adapter_run,
+        "remove": adapter_remove,
+    }
+    return handlers[args.adapter_command](args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="llm-wiki",
@@ -2700,6 +3287,70 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retract.add_argument("--json", action="store_true", help="Print a machine-readable report.")
     retract.set_defaults(func=run_retract)
+
+    adapter = subparsers.add_parser(
+        "adapter",
+        help="Register and run explicitly trusted local private adapters.",
+        description=(
+            "Manage the machine-local private-adapter registry. Adapter code and "
+            "credentials stay outside the wiki; successful runs return verified "
+            "artifacts but never import them automatically."
+        ),
+    )
+    adapter_sub = adapter.add_subparsers(dest="adapter_command", required=True)
+
+    adapter_add_parser = adapter_sub.add_parser(
+        "add", help="Register an adapter from an existing local checkout."
+    )
+    adapter_add_parser.add_argument("path", help="Local adapter root containing .llm-wiki-adapter.json.")
+    adapter_add_parser.add_argument(
+        "--read-root", action="append", default=[], help="Allowed adapter input root; repeatable."
+    )
+    adapter_add_parser.add_argument(
+        "--write-root", action="append", default=[], help="Allowed adapter output root; repeatable."
+    )
+    adapter_add_parser.add_argument(
+        "--env", action="append", default=[], help="Environment variable name to pass without storing its value; repeatable."
+    )
+    adapter_add_parser.add_argument(
+        "--replace", action="store_true", help="Replace an existing registration with the same id."
+    )
+    adapter_add_parser.add_argument("--json", action="store_true", help="Print JSON.")
+
+    adapter_list_parser = adapter_sub.add_parser("list", help="List registered adapters.")
+    adapter_list_parser.add_argument("--json", action="store_true", help="Print JSON.")
+
+    adapter_show_parser = adapter_sub.add_parser("show", help="Show one registration.")
+    adapter_show_parser.add_argument("adapter_id", help="Registered adapter id.")
+
+    adapter_doctor_parser = adapter_sub.add_parser(
+        "doctor", help="Validate a registration and perform the describe handshake."
+    )
+    adapter_doctor_parser.add_argument("adapter_id", help="Registered adapter id.")
+    adapter_doctor_parser.add_argument(
+        "--timeout", type=int, default=30, help="Handshake timeout in seconds."
+    )
+    adapter_doctor_parser.add_argument("--json", action="store_true", help="Print JSON.")
+
+    adapter_run_parser = adapter_sub.add_parser(
+        "run", help="Execute a registered operation from a JSON request."
+    )
+    adapter_run_parser.add_argument("adapter_id", help="Registered adapter id.")
+    adapter_run_parser.add_argument("--request", required=True, help="Absolute path to the v1 request JSON.")
+    adapter_run_parser.add_argument(
+        "--response", help="Optional path where the validated response receipt is copied."
+    )
+    adapter_run_parser.add_argument(
+        "--timeout", type=int, default=3600, help="Execution timeout in seconds."
+    )
+    adapter_run_parser.add_argument("--json", action="store_true", help="Print JSON.")
+
+    adapter_remove_parser = adapter_sub.add_parser("remove", help="Remove a local registration.")
+    adapter_remove_parser.add_argument("adapter_id", help="Registered adapter id.")
+    adapter_remove_parser.add_argument("--yes", action="store_true", help="Confirm removal.")
+    adapter_remove_parser.add_argument("--json", action="store_true", help="Print JSON.")
+
+    adapter.set_defaults(func=run_adapter)
 
     return parser
 
