@@ -8,12 +8,19 @@ humans a local command for the checks that can be done without an LLM.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
+import getpass
+import hashlib
 import json
+import math
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,6 +35,7 @@ ARTICLE_DIRS = {
 }
 INVENTORY_KINDS = {
     "item",
+    "idea",
     "ingest-candidate",
     "entity",
     "corpus",
@@ -51,9 +59,46 @@ SCHEMA_STATUSES = {"unknown", "inferred", "declared", "validated"}
 CONFIDENCE_VALUES = {"high", "medium", "low"}
 VOLATILITY_VALUES = {"hot", "warm", "cold"}
 PERMISSION_DENIED_ERRNOS = {1, 13}
+WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^/?[A-Za-z]:[\\/]")
+ADAPTER_PROTOCOL = "llm-wiki-adapter/v1"
+ADAPTER_REGISTRY_SCHEMA = 1
+ADAPTER_MANIFEST_NAME = ".llm-wiki-adapter.json"
+ADAPTER_ARTIFACT_CLASSES = {"wiki-safe", "private", "bulk"}
+ADAPTER_REMOTE_EFFECTS = {"remote-read", "remote-write"}
+ADAPTER_ROUTE_RESOURCE_KINDS = {"url"}
+SPECIALIST_REGISTRY_SCHEMA = 1
+SPECIALIST_RISK_TIERS = {"low", "medium", "high"}
+SPECIALIST_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+SPECIALIST_REQUIRED_SECTIONS = [
+    "Mandate",
+    "Non-claims",
+    "Use when",
+    "Do not use when",
+    "Required inputs",
+    "Method",
+    "Output contract",
+    "Stop and escalation rules",
+    "Tool posture",
+    "Evaluation cases",
+    "Provenance and maintenance",
+]
+CHECKPOINT_SCHEMA = "llm-wiki/project-knowledge-checkpoint/v1"
+CHECKPOINT_PRIVACY_SCHEMA = "llm-wiki/checkpoint-privacy-report/v1"
+CHECKPOINT_SCANNER_VERSION = 1
+CHECKPOINT_AUDIENCES = {"private", "team", "public"}
+CHECKPOINT_REQUIRED_FILES = {
+    "index.md",
+    "project-knowledge.md",
+    "sources.md",
+    "checkpoint.json",
+}
+CHECKPOINT_REPORT_NAME = "privacy-report.json"
+CHECKPOINT_MAX_FILE_BYTES = 10 * 1024 * 1024
+CHECKPOINT_MIN_KNOWLEDGE_RETENTION_RATIO = 0.20
 
 ROOT_ALLOWED = {
     "_index.md",
+    "README.md",
     "config.md",
     "schema.md",
     "log.md",
@@ -72,12 +117,39 @@ ROOT_ALLOWED = {
     ".session-checkpoint.json",
     ".sessions",
 }
-HUB_ALLOWED = {"wikis.json", "_index.md", "log.md", "topics", ".sessions"}
+HUB_ALLOWED = {
+    "wikis.json",
+    "_index.md",
+    "README.md",
+    "log.md",
+    "topics",
+    ".sessions",
+    ".skills",
+}
+# When a wiki or hub root is itself a git repository root, these conventional
+# VCS/project files legitimately coexist with the wiki schema and must never
+# be treated as unexpected content to quarantine into inbox/.unknown.
+GIT_ROOT_META_ALLOWED = {
+    ".git",
+    ".github",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CHANGELOG.md",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "LICENSE.md",
+    "SECURITY.md",
+    ".gitignore",
+    ".gitattributes",
+    ".gitmodules",
+}
 RAW_ALLOWED = {"_index.md", "articles", "papers", "repos", "notes", "data"}
 WIKI_ALLOWED = {"_index.md", "concepts", "topics", "references", "theses"}
 INVENTORY_ALLOWED = {
     "_index.md",
     "items",
+    "ideas",
     "candidates",
     "entities",
     "corpora",
@@ -121,6 +193,16 @@ class Document:
     body: str
 
 
+@dataclass(frozen=True)
+class CheckpointFinding:
+    finding_id: str
+    category: str
+    severity: str
+    path: str
+    line: int
+    message: str
+
+
 class LintContext:
     def __init__(self, root: Path, fix: bool = False) -> None:
         self.root = root.resolve()
@@ -134,7 +216,7 @@ class LintContext:
         if path is None:
             return ""
         try:
-            return str(path.resolve().relative_to(self.root))
+            return path.resolve().relative_to(self.root).as_posix()
         except ValueError:
             return str(path)
 
@@ -529,6 +611,7 @@ def check_structure(ctx: LintContext) -> None:
         ensure_dir_index(ctx, ctx.root / "inventory", "Inventory")
         for rel, title in [
             ("inventory/items", "Items"),
+            ("inventory/ideas", "Ideas"),
             ("inventory/candidates", "Candidates"),
             ("inventory/entities", "Entities"),
             ("inventory/corpora", "Corpora"),
@@ -800,6 +883,8 @@ def canonical_path_for(root: Path, doc: Document) -> Path | None:
         kind = fm.get("kind")
         if kind == "item":
             return root / "inventory" / "items" / doc.path.name
+        if kind == "idea":
+            return root / "inventory" / "ideas" / doc.path.name
         if kind == "entity":
             return root / "inventory" / "entities" / doc.path.name
         if kind == "corpus":
@@ -867,6 +952,8 @@ def check_unknown_files(ctx: LintContext) -> None:
     if not ctx.root.exists():
         return
     root_allowed = HUB_ALLOWED if is_hub(ctx.root) else ROOT_ALLOWED
+    if (ctx.root / ".git").exists():
+        root_allowed = root_allowed | GIT_ROOT_META_ALLOWED
     for child in sorted(ctx.root.iterdir()):
         if child.name not in root_allowed:
             handle_unknown(ctx, child, "Unexpected file or directory at wiki root.")
@@ -906,7 +993,10 @@ def check_unknown_files(ctx: LintContext) -> None:
     for base, allowed_dirs in [
         (ctx.root / "raw", {"articles", "papers", "repos", "notes", "data"}),
         (ctx.root / "wiki", {"concepts", "topics", "references", "theses"}),
-        (ctx.root / "inventory", {"items", "candidates", "entities", "corpora", "views"}),
+        (
+            ctx.root / "inventory",
+            {"items", "ideas", "candidates", "entities", "corpora", "views"},
+        ),
     ]:
         if not base.exists():
             continue
@@ -1068,6 +1158,9 @@ def is_local_markdown_link(link: str) -> bool:
 
 def resolve_link_target(base_dir: Path, link: str) -> Path:
     target = link.split("#", 1)[0]
+    windows_target = windows_absolute_path(target)
+    if windows_target is not None:
+        return windows_target
     if target.startswith("/"):
         return Path(target)
     return (base_dir / target).resolve()
@@ -1180,8 +1273,9 @@ def resolve_source_ref(ctx: LintContext, owner: Path, ref: str, wiki_source: boo
     if ref.startswith(("http://", "https://")):
         return None if wiki_source else Path(ref)
     candidates: list[Path] = []
-    ref_path = Path(ref)
-    if ref_path.is_absolute():
+    windows_ref = windows_absolute_path(ref)
+    ref_path = windows_ref or Path(ref)
+    if windows_ref is not None or ref_path.is_absolute():
         candidates.append(ref_path)
     elif ref.startswith(("../", "./")):
         candidates.append((owner.parent / ref).resolve())
@@ -1344,7 +1438,7 @@ def create_or_update_coverage_reference(ctx: LintContext, unreferenced: list[Pat
 
 
 def markdown_relative_link(base_dir: Path, target: Path) -> str:
-    rel = os.path.relpath(target, base_dir)
+    rel = Path(os.path.relpath(target, base_dir)).as_posix()
     return markdown_link_destination(rel)
 
 
@@ -1427,11 +1521,37 @@ def append_lint_log(ctx: LintContext) -> None:
 
 
 def expand_leading_tilde(value: str) -> Path:
+    windows_path = windows_absolute_path(value)
+    if windows_path is not None:
+        return windows_path
     if value == "~":
         return Path.home()
     if value.startswith("~/"):
         return Path.home() / value[2:]
     return Path(value)
+
+
+def windows_absolute_path(value: str) -> Path | None:
+    normalized = normalize_windows_absolute_path(value)
+    if normalized is None:
+        return None
+    return Path(normalized)
+
+
+def normalize_windows_absolute_path(
+    value: str, platform: str | None = None
+) -> str | None:
+    """Return a canonical drive path only when Windows semantics apply.
+
+    Keeping recognition separate from ``Path`` construction makes the three
+    accepted spellings testable on every development platform. POSIX must not
+    reinterpret a valid filename such as ``C:\\notes`` as an absolute path.
+    """
+    if (platform or os.name) != "nt" or not WINDOWS_ABSOLUTE_PATH_RE.match(value):
+        return None
+    if value.startswith("/"):
+        value = value[1:]
+    return value.replace("\\", "/")
 
 
 def initialized_wiki_root(path: Path) -> bool:
@@ -1485,6 +1605,98 @@ def resolve_registry_path(raw_path: str, hub: Path) -> Path:
     if path.is_absolute():
         return path
     return hub / path
+
+
+def check_hub_registry(ctx: LintContext) -> None:
+    registry = ctx.root / "wikis.json"
+    if not registry.exists():
+        return
+    try:
+        data = json.loads(registry.read_text(encoding="utf-8"))
+    except OSError as exc:
+        if is_permission_denied(exc):
+            ctx.issue("critical", permission_denied_message(registry, "read wiki registry", exc), registry)
+            return
+        ctx.issue("critical", f"Could not read wiki registry: {exc}", registry)
+        return
+    except json.JSONDecodeError as exc:
+        ctx.issue("critical", f"Invalid wiki registry: {exc}", registry)
+        return
+
+    changed = False
+    default_path = data.get("default")
+    if isinstance(default_path, str) and default_path not in {"<HUB>", "HUB", "."}:
+        if ctx.fix:
+            data["default"] = "<HUB>"
+            ctx.fixed("Rewrote hub registry default to <HUB>.")
+            changed = True
+        else:
+            ctx.issue(
+                "suggestion",
+                "Hub registry default should use the portable <HUB> token.",
+                registry,
+                fixable=True,
+            )
+
+    wikis = data.get("wikis")
+    if not isinstance(wikis, dict):
+        return
+    for slug, entry in sorted(wikis.items()):
+        if not isinstance(entry, dict):
+            continue
+        raw_path = entry.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        if slug == "hub":
+            if raw_path not in {"<HUB>", "HUB", "."}:
+                if ctx.fix:
+                    entry["path"] = "<HUB>"
+                    ctx.fixed("Rewrote hub registry entry path to <HUB>.")
+                    changed = True
+                else:
+                    ctx.issue(
+                        "suggestion",
+                        "Hub registry entry should use portable path <HUB>.",
+                        registry,
+                        fixable=True,
+                    )
+            continue
+
+        relative_path = (
+            f"topics/.archive/{slug}" if is_archived_registry_entry(entry) else f"topics/{slug}"
+        )
+        hub_topic = ctx.root / relative_path
+        if initialized_wiki_root(hub_topic) and raw_path != relative_path:
+            if ctx.fix:
+                entry["path"] = relative_path
+                ctx.fixed(f"Rewrote hub-owned registry path for {slug} to {relative_path}.")
+                changed = True
+            else:
+                ctx.issue(
+                    "suggestion",
+                    f"Hub-owned wiki path should be portable: use {relative_path}.",
+                    registry,
+                    fixable=True,
+                )
+            continue
+
+        resolved = resolve_registry_path(raw_path, ctx.root)
+        if resolved.is_absolute() and not is_under(resolved, ctx.root):
+            if resolved.exists():
+                ctx.issue(
+                    "info",
+                    f"Registry path for {slug} is an external local absolute path that exists: {raw_path}.",
+                    registry,
+                )
+            else:
+                ctx.issue(
+                    "warning",
+                    f"Registry path for {slug} is an external local absolute path that does not exist: {raw_path}.",
+                    registry,
+                )
+
+    if changed:
+        write_registry(ctx.root, data)
 
 
 def is_archived_registry_entry(entry: dict[str, Any] | None) -> bool:
@@ -1620,6 +1832,8 @@ def run_lint(args: argparse.Namespace) -> int:
     check_structure(ctx)
     check_unknown_files(ctx)
     if hub_root:
+        check_specialist_library(ctx)
+        check_hub_registry(ctx)
         append_lint_log(ctx)
         if args.json:
             print_json_report(ctx)
@@ -2060,6 +2274,2927 @@ def restore_topic(hub: Path, data: dict[str, Any], slug: str) -> int:
     return 0
 
 
+RETRACTED_MARKER = "[RETRACTED]"
+RETRACT_SKIP_NAMES = {".git", ".hg", ".svn"}
+
+
+@dataclass
+class RetractScan:
+    files_scanned: int
+    text_matches: list[tuple[Path, int]]
+    binary_matches: list[tuple[Path, int]]
+    name_matches: list[tuple[Path, str]]
+    symlink_matches: list[Path]
+    skipped_control_paths: list[Path]
+    errors: list[str]
+
+
+def read_retract_value(args: argparse.Namespace) -> bytes:
+    if args.stdin:
+        value = sys.stdin.buffer.read()
+    else:
+        value = getpass.getpass("Value to retract: ").encode("utf-8")
+    if not value:
+        raise SystemExit("retract value is empty")
+    if value == RETRACTED_MARKER.encode("utf-8"):
+        raise SystemExit("retract value cannot be the replacement marker")
+    return value
+
+
+def retract_patterns(value: bytes, mode: str) -> tuple[list[bytes], list[str]]:
+    byte_patterns = {value}
+    name_patterns: set[str] = set()
+    try:
+        text = value.decode("utf-8")
+    except UnicodeDecodeError:
+        text = ""
+    if text:
+        name_patterns.add(text)
+    if mode == "common" and text and len(value) >= 4:
+        encoded = {
+            json.dumps(text, ensure_ascii=True)[1:-1],
+            urllib.parse.quote(text, safe=""),
+            urllib.parse.quote_plus(text, safe=""),
+            base64.b64encode(value).decode("ascii"),
+            base64.urlsafe_b64encode(value).decode("ascii"),
+            value.hex(),
+        }
+        encoded.update(item.rstrip("=") for item in list(encoded) if item.endswith("="))
+        encoded.discard("")
+        encoded.discard(text)
+        for item in encoded:
+            byte_patterns.add(item.encode("utf-8"))
+            name_patterns.add(item)
+    return (
+        sorted(byte_patterns, key=lambda item: (-len(item), item)),
+        sorted(name_patterns, key=lambda item: (-len(item), item)),
+    )
+
+
+def registry_retract_roots(hub: Path) -> list[Path]:
+    roots = [hub]
+    registry = hub / "wikis.json"
+    if not registry.exists():
+        return roots
+    data = read_registry(hub)
+    for entry in data.get("wikis", {}).values():
+        if isinstance(entry, dict) and entry.get("path"):
+            roots.append(resolve_registry_path(str(entry["path"]), hub))
+    local_wikis = data.get("local_wikis", [])
+    if isinstance(local_wikis, list):
+        for entry in local_wikis:
+            if isinstance(entry, str):
+                roots.append(resolve_registry_path(entry, hub))
+            elif isinstance(entry, dict) and entry.get("path"):
+                roots.append(resolve_registry_path(str(entry["path"]), hub))
+    return roots
+
+
+def minimize_roots(paths: list[Path]) -> list[Path]:
+    selected: list[Path] = []
+    for path in paths:
+        try:
+            candidate = path.expanduser().resolve()
+        except OSError:
+            candidate = path.expanduser().absolute()
+        if any(candidate == root or is_under(candidate, root) for root in selected):
+            continue
+        selected = [root for root in selected if not is_under(root, candidate)]
+        selected.append(candidate)
+        selected.sort(key=lambda item: (len(item.parts), str(item)))
+    return selected
+
+
+def resolve_retract_roots(args: argparse.Namespace) -> list[Path]:
+    if args.everywhere and (args.path or args.local or args.wiki):
+        raise SystemExit("--everywhere cannot be combined with a path, --local, or --wiki")
+    if args.everywhere:
+        hub = resolve_hub(args)
+        roots = registry_retract_roots(hub)
+        local = Path.cwd() / ".wiki"
+        if local.exists():
+            roots.append(local)
+    elif args.path:
+        roots = [expand_leading_tilde(str(args.path))]
+    else:
+        # Retraction is allowed to target archived material. Archive state is
+        # wiki context, not a mutation gate for this control-plane operation.
+        args.include_archived = True
+        roots = [resolve_wiki_root(args)]
+    roots = minimize_roots(roots)
+    if not roots:
+        raise SystemExit("no initialized retract scope found")
+    return roots
+
+
+def replace_name(value: str, patterns: list[str]) -> str:
+    for pattern in patterns:
+        value = value.replace(pattern, RETRACTED_MARKER)
+    return value
+
+
+def sanitized_text(value: str, patterns: list[str]) -> str:
+    return replace_name(value, patterns)
+
+
+def sanitized_error(exc: BaseException, patterns: list[str]) -> str:
+    return sanitized_text(str(exc), patterns)
+
+
+def scan_retract_roots(
+    roots: list[Path], byte_patterns: list[bytes], name_patterns: list[str]
+) -> RetractScan:
+    text_matches: list[tuple[Path, int]] = []
+    binary_matches: list[tuple[Path, int]] = []
+    name_matches: list[tuple[Path, str]] = []
+    symlink_matches: list[Path] = []
+    skipped_control_paths: list[Path] = []
+    errors: list[str] = []
+    files_scanned = 0
+
+    def walk_error(exc: OSError) -> None:
+        path = Path(str(getattr(exc, "filename", "unknown")))
+        errors.append(
+            f"could not scan {sanitized_text(str(path), name_patterns)}: "
+            f"{sanitized_error(exc, name_patterns)}"
+        )
+
+    for root in roots:
+        if replace_name(root.name, name_patterns) != root.name:
+            errors.append(
+                "selected retract root name contains a match and must be moved manually: "
+                f"{sanitized_text(str(root), name_patterns)}"
+            )
+        if not root.exists():
+            errors.append(f"retract scope does not exist: {sanitized_text(str(root), name_patterns)}")
+            continue
+        if not root.is_dir():
+            errors.append(f"retract scope is not a directory: {sanitized_text(str(root), name_patterns)}")
+            continue
+        for current, dirnames, filenames in os.walk(root, topdown=True, followlinks=False, onerror=walk_error):
+            current_path = Path(current)
+            kept_dirs: list[str] = []
+            for name in dirnames:
+                path = current_path / name
+                if name in RETRACT_SKIP_NAMES:
+                    skipped_control_paths.append(path)
+                    continue
+                renamed = replace_name(name, name_patterns)
+                if renamed != name:
+                    name_matches.append((path, renamed))
+                if path.is_symlink():
+                    try:
+                        target = os.readlink(path)
+                        if replace_name(target, name_patterns) != target:
+                            symlink_matches.append(path)
+                    except OSError as exc:
+                        errors.append(
+                            f"could not inspect {sanitized_text(str(path), name_patterns)}: "
+                            f"{sanitized_error(exc, name_patterns)}"
+                        )
+                    continue
+                kept_dirs.append(name)
+            dirnames[:] = kept_dirs
+
+            for name in filenames:
+                path = current_path / name
+                if name in RETRACT_SKIP_NAMES:
+                    skipped_control_paths.append(path)
+                    continue
+                renamed = replace_name(name, name_patterns)
+                if renamed != name:
+                    name_matches.append((path, renamed))
+                if path.is_symlink():
+                    try:
+                        target = os.readlink(path)
+                        if replace_name(target, name_patterns) != target:
+                            symlink_matches.append(path)
+                    except OSError as exc:
+                        errors.append(
+                            f"could not inspect {sanitized_text(str(path), name_patterns)}: "
+                            f"{sanitized_error(exc, name_patterns)}"
+                        )
+                    continue
+                try:
+                    data = path.read_bytes()
+                except OSError as exc:
+                    errors.append(
+                        f"could not read {sanitized_text(str(path), name_patterns)}: "
+                        f"{sanitized_error(exc, name_patterns)}"
+                    )
+                    continue
+                files_scanned += 1
+                occurrences = sum(data.count(pattern) for pattern in byte_patterns)
+                if not occurrences:
+                    continue
+                try:
+                    data.decode("utf-8")
+                    is_text = b"\x00" not in data
+                except UnicodeDecodeError:
+                    is_text = False
+                target = text_matches if is_text else binary_matches
+                target.append((path, occurrences))
+
+    return RetractScan(
+        files_scanned=files_scanned,
+        text_matches=text_matches,
+        binary_matches=binary_matches,
+        name_matches=name_matches,
+        symlink_matches=symlink_matches,
+        skipped_control_paths=skipped_control_paths,
+        errors=errors,
+    )
+
+
+def atomic_replace_patterns(path: Path, patterns: list[bytes]) -> int:
+    data = path.read_bytes()
+    replacement = RETRACTED_MARKER.encode("utf-8")
+    count = 0
+    for pattern in patterns:
+        found = data.count(pattern)
+        if found:
+            data = data.replace(pattern, replacement)
+            count += found
+    if not count:
+        return 0
+    mode = path.stat().st_mode & 0o7777
+    fd, temporary_name = tempfile.mkstemp(prefix=".llm-wiki-retract-", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return count
+
+
+def apply_retract(
+    scan: RetractScan,
+    byte_patterns: list[bytes],
+    delete_binary_matches: bool,
+    name_patterns: list[str],
+) -> tuple[int, int, int, list[str]]:
+    rewritten = 0
+    deleted = 0
+    renamed = 0
+    errors: list[str] = []
+    for path, _ in scan.text_matches:
+        try:
+            if atomic_replace_patterns(path, byte_patterns):
+                rewritten += 1
+        except OSError as exc:
+            errors.append(
+                f"could not rewrite {sanitized_text(str(path), name_patterns)}: "
+                f"{sanitized_error(exc, name_patterns)}"
+            )
+    if delete_binary_matches:
+        for path, _ in scan.binary_matches:
+            try:
+                path.unlink()
+                deleted += 1
+            except OSError as exc:
+                errors.append(
+                    f"could not delete {sanitized_text(str(path), name_patterns)}: "
+                    f"{sanitized_error(exc, name_patterns)}"
+                )
+
+    # Rename deepest entries first so parent renames do not invalidate child paths.
+    for path, new_name in sorted(scan.name_matches, key=lambda item: len(item[0].parts), reverse=True):
+        if not path.exists() and not path.is_symlink():
+            continue
+        destination = path.with_name(new_name)
+        if destination.exists() or destination.is_symlink():
+            errors.append(
+                "could not rename "
+                f"{sanitized_text(str(path), name_patterns)}: destination already exists"
+            )
+            continue
+        try:
+            path.rename(destination)
+            renamed += 1
+        except OSError as exc:
+            errors.append(
+                f"could not rename {sanitized_text(str(path), name_patterns)}: "
+                f"{sanitized_error(exc, name_patterns)}"
+            )
+    return rewritten, deleted, renamed, errors
+
+
+def retract_report(
+    args: argparse.Namespace,
+    roots: list[Path],
+    scan: RetractScan,
+    name_patterns: list[str],
+    rewritten: int = 0,
+    deleted: int = 0,
+    renamed: int = 0,
+    verification: RetractScan | None = None,
+) -> dict[str, Any]:
+    unresolved_binary = len(scan.binary_matches) if not args.delete_binary_matches else 0
+    verification_matches = 0
+    verification_errors: list[str] = []
+    if verification is not None:
+        verification_matches = (
+            len(verification.text_matches)
+            + len(verification.binary_matches)
+            + len(verification.name_matches)
+            + len(verification.symlink_matches)
+        )
+        verification_errors = verification.errors
+    errors = scan.errors + verification_errors
+    if errors:
+        status = "incomplete"
+    elif not args.apply:
+        status = "dry-run"
+    elif unresolved_binary or scan.symlink_matches or verification_matches:
+        status = "incomplete"
+    else:
+        status = "verified"
+
+    matched_paths = {
+        sanitized_text(str(path), name_patterns)
+        for path, _ in scan.text_matches + scan.binary_matches
+    }
+    matched_paths.update(
+        sanitized_text(str(path), name_patterns) for path, _ in scan.name_matches
+    )
+    matched_paths.update(sanitized_text(str(path), name_patterns) for path in scan.symlink_matches)
+    return {
+        "status": status,
+        "mode": "apply" if args.apply else "dry-run",
+        "scope": [sanitized_text(str(path), name_patterns) for path in roots],
+        "files_scanned": scan.files_scanned,
+        "text_files_matched": len(scan.text_matches),
+        "binary_files_matched": len(scan.binary_matches),
+        "path_names_matched": len(scan.name_matches),
+        "symlink_targets_matched": len(scan.symlink_matches),
+        "files_rewritten": rewritten,
+        "binary_files_deleted": deleted,
+        "paths_renamed": renamed,
+        "remaining_matches": verification_matches if verification is not None else None,
+        "skipped_version_control_paths": len(scan.skipped_control_paths),
+        "matched_paths": sorted(matched_paths),
+        "errors": errors,
+    }
+
+
+def print_retract_report(report: dict[str, Any]) -> None:
+    print(f"Retraction status: {report['status']}")
+    print(f"Mode: {report['mode']}")
+    print(f"Files scanned: {report['files_scanned']}")
+    print(
+        "Matches: "
+        f"{report['text_files_matched']} text files, "
+        f"{report['binary_files_matched']} binary files, "
+        f"{report['path_names_matched']} path names, "
+        f"{report['symlink_targets_matched']} symlink targets"
+    )
+    if report["mode"] == "apply":
+        print(
+            "Applied: "
+            f"{report['files_rewritten']} files rewritten, "
+            f"{report['binary_files_deleted']} binary files deleted, "
+            f"{report['paths_renamed']} paths renamed"
+        )
+        print(f"Remaining matches: {report['remaining_matches']}")
+    if report["matched_paths"]:
+        print("Matched paths:")
+        for path in report["matched_paths"][:100]:
+            print(f"- {path}")
+        if len(report["matched_paths"]) > 100:
+            print(f"- ... {len(report['matched_paths']) - 100} more")
+    if report["skipped_version_control_paths"]:
+        print(
+            "Boundary: hidden version-control metadata was not scanned or changed "
+            f"({report['skipped_version_control_paths']} paths)."
+        )
+    for error in report["errors"]:
+        print(f"Error: {error}", file=sys.stderr)
+    if report["mode"] == "dry-run":
+        print("Dry run only. Re-run with --apply to write changes.")
+
+
+def run_retract(args: argparse.Namespace) -> int:
+    value = read_retract_value(args)
+    byte_patterns, name_patterns = retract_patterns(value, args.variants)
+    try:
+        roots = resolve_retract_roots(args)
+    except SystemExit as exc:
+        raise SystemExit(sanitized_text(str(exc), name_patterns)) from exc
+    scan = scan_retract_roots(roots, byte_patterns, name_patterns)
+    rewritten = deleted = renamed = 0
+    verification: RetractScan | None = None
+    if args.apply:
+        rewritten, deleted, renamed, apply_errors = apply_retract(
+            scan, byte_patterns, args.delete_binary_matches, name_patterns
+        )
+        scan.errors.extend(apply_errors)
+        if rewritten or deleted or renamed:
+            for root in roots:
+                try:
+                    append_log(
+                        root,
+                        "retract",
+                        "user-directed data retraction; local content updated",
+                    )
+                    log_path = root / "log.md"
+                    if log_path.exists():
+                        atomic_replace_patterns(log_path, byte_patterns)
+                except OSError as exc:
+                    scan.errors.append(
+                        "could not append operation log at "
+                        f"{sanitized_text(str(root), name_patterns)}: "
+                        f"{sanitized_error(exc, name_patterns)}"
+                    )
+        verification = scan_retract_roots(roots, byte_patterns, name_patterns)
+    report = retract_report(
+        args,
+        roots,
+        scan,
+        name_patterns,
+        rewritten=rewritten,
+        deleted=deleted,
+        renamed=renamed,
+        verification=verification,
+    )
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print_retract_report(report)
+    return 2 if report["status"] == "incomplete" else 0
+
+
+def specialist_library_path(hub: Path) -> Path:
+    return hub / ".skills"
+
+
+def specialist_registry_path(hub: Path) -> Path:
+    return specialist_library_path(hub) / "registry.json"
+
+
+def empty_specialist_registry() -> dict[str, Any]:
+    return {"schema_version": SPECIALIST_REGISTRY_SCHEMA, "topics": {}}
+
+
+def require_initialized_hub(hub: Path) -> dict[str, Any]:
+    if not is_hub(hub) or not (hub / "_index.md").exists() or not (hub / "log.md").exists():
+        raise SystemExit(f"initialized hub not found: {hub}")
+    return read_registry(hub)
+
+
+def read_specialist_registry(hub: Path) -> dict[str, Any]:
+    path = specialist_registry_path(hub)
+    if not path.exists():
+        return empty_specialist_registry()
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"specialist registry must be a regular file: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        if is_permission_denied(exc):
+            raise SystemExit(permission_denied_message(path, "read specialist registry", exc)) from exc
+        raise SystemExit(f"could not read specialist registry {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid specialist registry {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit(f"invalid specialist registry {path}: root must be an object")
+    if data.get("schema_version") != SPECIALIST_REGISTRY_SCHEMA:
+        raise SystemExit(
+            f"unsupported specialist registry schema in {path}: "
+            f"expected {SPECIALIST_REGISTRY_SCHEMA}"
+        )
+    if not isinstance(data.get("topics"), dict):
+        raise SystemExit(f"invalid specialist registry {path}: topics must be an object")
+    return data
+
+
+def write_specialist_registry(hub: Path, data: dict[str, Any]) -> None:
+    path = specialist_registry_path(hub)
+    write_private_json(path, data)
+
+
+def specialist_frontmatter_value(frontmatter: str, field: str) -> str | None:
+    match = re.search(rf"(?m)^{re.escape(field)}\s*:\s*(.*)$", frontmatter)
+    if not match:
+        return None
+    value = match.group(1).strip()
+    if value in {">", "|", ">-", "|-"}:
+        continuation: list[str] = []
+        remainder = frontmatter[match.end() :]
+        for line in remainder.splitlines():
+            if not line.strip():
+                if continuation:
+                    continuation.append("")
+                continue
+            if not line.startswith((" ", "\t")):
+                break
+            continuation.append(line.strip())
+        value = " ".join(part for part in continuation if part)
+    if not value:
+        return None
+    return strip_matching_quotes(value)
+
+
+def specialist_metadata_value(frontmatter: str, field: str) -> str | None:
+    metadata = re.search(r"(?m)^metadata\s*:\s*$", frontmatter)
+    if not metadata:
+        return None
+    remainder = frontmatter[metadata.end() :]
+    for line in remainder.splitlines():
+        if line and not line.startswith((" ", "\t")):
+            break
+        match = re.match(rf"\s+{re.escape(field)}\s*:\s*(.+?)\s*$", line)
+        if match:
+            return strip_matching_quotes(match.group(1).strip())
+    return None
+
+
+def read_specialist_record(path: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    split = split_markdown_frontmatter(text)
+    frontmatter, body = split if split is not None else ("", text)
+    name = specialist_frontmatter_value(frontmatter, "name") or path.parent.name
+    description = specialist_frontmatter_value(frontmatter, "description") or ""
+    version = specialist_metadata_value(frontmatter, "version") or ""
+    risk_tier = specialist_metadata_value(frontmatter, "risk-tier") or ""
+    reviewed = specialist_metadata_value(frontmatter, "reviewed") or ""
+    return {
+        "name": name,
+        "description": description,
+        "version": version,
+        "risk_tier": risk_tier,
+        "reviewed": reviewed,
+        "path": str(path),
+        "frontmatter": frontmatter,
+        "body": body.lstrip("\n"),
+        "sha256": file_sha256(path),
+    }
+
+
+def discover_specialists(hub: Path) -> list[dict[str, Any]]:
+    library = specialist_library_path(hub)
+    if not library.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    for child in sorted(library.iterdir()):
+        skill = child / "SKILL.md"
+        if (
+            child.is_dir()
+            and not child.is_symlink()
+            and skill.is_file()
+            and not skill.is_symlink()
+        ):
+            records.append(read_specialist_record(skill))
+    return records
+
+
+def enabled_specialist_topics(registry: dict[str, Any], name: str) -> list[str]:
+    return sorted(
+        topic
+        for topic, names in registry.get("topics", {}).items()
+        if isinstance(names, list) and name in names
+    )
+
+
+def specialist_rows(hub: Path, registry: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    library = specialist_library_path(hub)
+    for record in discover_specialists(hub):
+        rows.append(
+            {
+                "name": record["name"],
+                "description": record["description"],
+                "version": record["version"],
+                "risk_tier": record["risk_tier"],
+                "reviewed": record["reviewed"],
+                "enabled_topics": enabled_specialist_topics(registry, record["name"]),
+                "path": str(Path(record["path"]).relative_to(library)),
+                "sha256": record["sha256"],
+            }
+        )
+    return rows
+
+
+def write_specialist_index(hub: Path, registry: dict[str, Any] | None = None) -> None:
+    registry = registry or read_specialist_registry(hub)
+    library = specialist_library_path(hub)
+    library.mkdir(parents=True, exist_ok=True)
+    rows = specialist_rows(hub, registry)
+    table_rows = [
+        "| Specialist | Description | Version | Risk | Enabled topics | Reviewed |",
+        "|------------|-------------|---------|------|----------------|----------|",
+    ]
+    for row in rows:
+        topics = ", ".join(row["enabled_topics"]) or "—"
+        table_rows.append(
+            f"| [{table_cell(row['name'])}]({markdown_link_destination(row['path'])}) "
+            f"| {table_cell(row['description'])} | {table_cell(row['version'] or '—')} "
+            f"| {table_cell(row['risk_tier'] or '—')} | {table_cell(topics)} "
+            f"| {table_cell(row['reviewed'] or '—')} |"
+        )
+    text = "\n".join(
+        [
+            "# Specialist Skills Index",
+            "",
+            "> Personal, instruction-only specialist methods shared across topic wikis.",
+            "",
+            f"Last updated: {today_date().isoformat()}",
+            "",
+            "## Contents",
+            "",
+            *table_rows,
+            "",
+            "## Safety boundary",
+            "",
+            "- Specialists are methods and review protocols, not human credentials.",
+            "- Topic use is explicit through `registry.json`; no specialist is enabled globally.",
+            "- Packages may contain only `SKILL.md` and Markdown under `references/`.",
+            "- Loading a specialist never expands the orchestrator's tools or write authority.",
+            "- Do not store credentials, case files, health records, customer data, or source corpora here.",
+            "",
+        ]
+    )
+    index = library / "_index.md"
+    if index.is_symlink():
+        raise SystemExit(f"specialist index must not be a symlink: {index}")
+    index.write_text(text, encoding="utf-8")
+
+
+def initialize_specialist_library(hub: Path) -> bool:
+    require_initialized_hub(hub)
+    library = specialist_library_path(hub)
+    if library.exists() and (library.is_symlink() or not library.is_dir()):
+        raise SystemExit(f"specialist library must be a real directory: {library}")
+    created = not library.exists()
+    library.mkdir(parents=True, exist_ok=True)
+    registry_path = specialist_registry_path(hub)
+    if not registry_path.exists():
+        write_specialist_registry(hub, empty_specialist_registry())
+        created = True
+    registry = read_specialist_registry(hub)
+    if not (library / "_index.md").exists():
+        created = True
+    write_specialist_index(hub, registry)
+    return created
+
+
+def validate_specialist_name(name: str) -> None:
+    if len(name) > 64 or not SPECIALIST_NAME_RE.fullmatch(name):
+        raise SystemExit(
+            "specialist name must be 1-64 lowercase letters, digits, and single hyphens"
+        )
+
+
+def specialist_scaffold(name: str, description: str, risk_tier: str) -> str:
+    today = today_date().isoformat()
+    return f'''---
+name: {name}
+description: {yaml_quote(description)}
+metadata:
+  llm-wiki-kind: specialist
+  version: "0.1.0"
+  risk-tier: {risk_tier}
+  reviewed: "{today}"
+---
+
+# Mandate
+
+Define the bounded review or evidence method this specialist applies. Do not
+claim a human credential, license, office, degree, or professional authority.
+
+# Non-claims
+
+- This skill is an AI analysis protocol, not a credentialed professional.
+- It does not provide professional sign-off or expand the caller's authority.
+
+# Use when
+
+- List concrete task features that should select this specialist.
+
+# Do not use when
+
+- List nearby tasks that need another method or no specialist.
+
+# Required inputs
+
+- Exact question and intended decision or use.
+- Bounded evidence packet, source dates, and known missing information.
+- Jurisdiction and decision stakes when they materially affect the answer.
+
+# Method
+
+1. Define the ordered analytical procedure.
+2. State the domain-specific evidence hierarchy.
+3. Test the strongest alternative explanation or downside case.
+4. Identify what evidence would change the conclusion.
+
+# Output contract
+
+Return findings, cited evidence, assumptions, uncertainties, counterarguments,
+confidence, and recommended next actions. Cite every material factual claim.
+
+# Stop and escalation rules
+
+- Stop when required inputs or current authoritative sources are missing.
+- Name the qualified human review required for high-stakes decisions.
+
+# Tool posture
+
+Read-only by default. This skill never grants tools, filesystem access, network
+access, subagents, or permission to mutate the wiki or an external system.
+
+# Evaluation cases
+
+- Positive selection case.
+- Nearby negative selection case.
+- Stale or contradictory evidence case.
+- Insufficient-data and escalation case.
+
+# Provenance and maintenance
+
+- Author/reviewer: TODO
+- Method sources: TODO
+- Review cadence: TODO
+- Change notes: 0.1.0 initial scaffold
+'''
+
+
+def validate_specialist_package(
+    hub: Path, directory: Path, expected_name: str | None = None
+) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+
+    def add(message: str, path: Path = directory) -> None:
+        issues.append({"severity": "critical", "message": message, "path": str(path)})
+
+    if directory.is_symlink():
+        add("Specialist package must not be a symlink.")
+        return issues
+    if not directory.is_dir():
+        add("Specialist package is not a directory.")
+        return issues
+    name = expected_name or directory.name
+    if len(name) > 64 or not SPECIALIST_NAME_RE.fullmatch(name):
+        add("Specialist directory name must be 1-64 lowercase letters, digits, and single hyphens.")
+    allowed = {"SKILL.md", "references"}
+    for child in sorted(directory.iterdir()):
+        if child.name not in allowed:
+            add("Instruction-only specialist packages may contain only SKILL.md and references/.", child)
+        if child.is_symlink():
+            add("Specialist package files and directories must not be symlinks.", child)
+    references = directory / "references"
+    if references.exists():
+        if not references.is_dir() or references.is_symlink():
+            add("references must be a real directory.", references)
+        else:
+            for item in sorted(references.rglob("*")):
+                if item.is_symlink():
+                    add("Specialist references must not be symlinks.", item)
+                elif item.is_file() and item.suffix.lower() != ".md":
+                    add("Specialist references must be Markdown files.", item)
+                elif item.is_file() and item.stat().st_mode & 0o111:
+                    add("Specialist references must not be executable.", item)
+    skill = directory / "SKILL.md"
+    if not skill.is_file() or skill.is_symlink():
+        add("Required SKILL.md is missing or is a symlink.", skill)
+        return issues
+    if skill.stat().st_mode & 0o111:
+        add("SKILL.md must not be executable.", skill)
+    try:
+        text = skill.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        add(f"SKILL.md must be readable UTF-8 Markdown: {exc}", skill)
+        return issues
+    split = split_markdown_frontmatter(text)
+    if split is None:
+        add("SKILL.md requires YAML frontmatter.", skill)
+        return issues
+    frontmatter, body = split
+    declared_name = specialist_frontmatter_value(frontmatter, "name")
+    description = specialist_frontmatter_value(frontmatter, "description")
+    if declared_name != name:
+        add(f"SKILL.md name must match its directory: expected {name!r}.", skill)
+    if not description or len(description) > 1024:
+        add("SKILL.md description must contain 1-1024 characters.", skill)
+    if specialist_metadata_value(frontmatter, "llm-wiki-kind") != "specialist":
+        add("metadata.llm-wiki-kind must be specialist.", skill)
+    version = specialist_metadata_value(frontmatter, "version")
+    if not version or not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
+        add("metadata.version must be a semantic version such as 0.1.0.", skill)
+    risk_tier = specialist_metadata_value(frontmatter, "risk-tier")
+    if risk_tier not in SPECIALIST_RISK_TIERS:
+        add("metadata.risk-tier must be low, medium, or high.", skill)
+    reviewed = specialist_metadata_value(frontmatter, "reviewed")
+    if not reviewed or parse_date(reviewed) is None:
+        add("metadata.reviewed must be an ISO date.", skill)
+    if re.search(r"(?m)^allowed-tools\s*:", frontmatter):
+        add("allowed-tools is not permitted; the llm-wiki orchestrator owns tool authority.", skill)
+    headings = set(re.findall(r"(?m)^#\s+(.+?)\s*$", body))
+    for section in SPECIALIST_REQUIRED_SECTIONS:
+        if section not in headings:
+            add(f"Required section is missing: # {section}.", skill)
+    return issues
+
+
+def collect_specialist_issues(hub: Path, name: str | None = None) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    library = specialist_library_path(hub)
+
+    def add(message: str, path: Path) -> None:
+        issues.append({"severity": "critical", "message": message, "path": str(path)})
+
+    if not library.exists():
+        if name:
+            add("Specialist library is not initialized.", library)
+        return issues
+    if library.is_symlink() or not library.is_dir():
+        add(".skills must be a real directory.", library)
+        return issues
+    if not (library / "_index.md").is_file():
+        add("Specialist library _index.md is missing.", library / "_index.md")
+    allowed_root_files = {"_index.md", "registry.json"}
+    packages: dict[str, Path] = {}
+    for child in sorted(library.iterdir()):
+        if child.name in allowed_root_files:
+            if child.is_symlink() or not child.is_file():
+                add("Specialist library control files must be regular files.", child)
+            continue
+        if not child.is_dir() or child.is_symlink():
+            add("Unexpected file in specialist library.", child)
+            continue
+        packages[child.name] = child
+    if name:
+        validate_specialist_name(name)
+        package = packages.get(name)
+        if package is None:
+            add(f"Specialist not found: {name}.", library / name)
+        else:
+            issues.extend(validate_specialist_package(hub, package, name))
+    else:
+        for package_name, package in packages.items():
+            issues.extend(validate_specialist_package(hub, package, package_name))
+    registry_path = specialist_registry_path(hub)
+    if not registry_path.is_file() or registry_path.is_symlink():
+        add("Specialist registry.json is missing or is not a regular file.", registry_path)
+        return issues
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        add(f"Specialist registry.json is invalid: {exc}", registry_path)
+        return issues
+    if not isinstance(registry, dict) or registry.get("schema_version") != SPECIALIST_REGISTRY_SCHEMA:
+        add(f"Specialist registry schema_version must be {SPECIALIST_REGISTRY_SCHEMA}.", registry_path)
+        return issues
+    topics = registry.get("topics")
+    if not isinstance(topics, dict):
+        add("Specialist registry topics must be an object.", registry_path)
+        return issues
+    try:
+        wiki_registry = read_registry(hub)
+    except SystemExit as exc:
+        add(str(exc), hub / "wikis.json")
+        return issues
+    active_topics = {
+        slug
+        for slug, entry in wiki_registry.get("wikis", {}).items()
+        if slug != "hub" and isinstance(entry, dict) and not is_archived_registry_entry(entry)
+    }
+    for topic, names in sorted(topics.items()):
+        if topic not in active_topics:
+            add(f"Specialists are enabled for unknown or archived topic: {topic}.", registry_path)
+        if not isinstance(names, list) or any(not isinstance(item, str) for item in names):
+            add(f"Specialist allowlist for {topic} must be an array of names.", registry_path)
+            continue
+        if len(names) != len(set(names)):
+            add(f"Specialist allowlist for {topic} contains duplicates.", registry_path)
+        for specialist_name in names:
+            if specialist_name not in packages:
+                add(f"Topic {topic} enables missing specialist: {specialist_name}.", registry_path)
+    return issues
+
+
+def check_specialist_library(ctx: LintContext) -> None:
+    if not specialist_library_path(ctx.root).exists():
+        return
+    for issue in collect_specialist_issues(ctx.root):
+        path = Path(issue["path"])
+        ctx.issue(issue["severity"], issue["message"], path)
+
+
+def specialist_init(args: argparse.Namespace) -> int:
+    hub = resolve_hub(args)
+    created = initialize_specialist_library(hub)
+    if created:
+        append_log(hub, "specialist", "initialized personal specialist skill library")
+    report = {
+        "status": "created" if created else "already-initialized",
+        "hub": str(hub),
+        "library": str(specialist_library_path(hub)),
+    }
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        action = "Initialized" if created else "Already initialized"
+        print(f"{action}: {specialist_library_path(hub)}")
+    return 0
+
+
+def specialist_create(args: argparse.Namespace) -> int:
+    name = args.name
+    validate_specialist_name(name)
+    description = re.sub(r"\s+", " ", args.description).strip()
+    if not description or len(description) > 1024:
+        raise SystemExit("specialist description must contain 1-1024 characters")
+    hub = resolve_hub(args)
+    initialize_specialist_library(hub)
+    directory = specialist_library_path(hub) / name
+    if directory.exists():
+        raise SystemExit(f"specialist already exists: {name}")
+    directory.mkdir()
+    skill = directory / "SKILL.md"
+    skill.write_text(specialist_scaffold(name, description, args.risk_tier), encoding="utf-8")
+    registry = read_specialist_registry(hub)
+    write_specialist_index(hub, registry)
+    append_log(hub, "specialist", f"created personal specialist {name} v0.1.0")
+    report = {
+        "status": "created",
+        "name": name,
+        "path": str(skill),
+        "risk_tier": args.risk_tier,
+        "version": "0.1.0",
+    }
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(f"Created specialist: {skill}")
+        print("Next: replace scaffold TODOs, add evaluation cases, then run specialist validate.")
+    return 0
+
+
+def specialist_refresh(args: argparse.Namespace) -> int:
+    hub = resolve_hub(args)
+    initialize_specialist_library(hub)
+    registry = read_specialist_registry(hub)
+    write_specialist_index(hub, registry)
+    append_log(hub, "specialist", "refreshed personal specialist skill index")
+    report = {
+        "status": "refreshed",
+        "index": str(specialist_library_path(hub) / "_index.md"),
+        "specialists": len(discover_specialists(hub)),
+    }
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(
+            f"Refreshed {report['index']} ({report['specialists']} specialists)."
+        )
+    return 0
+
+
+def active_topic_entry(hub: Path, topic: str) -> tuple[dict[str, Any], Path]:
+    registry = require_initialized_hub(hub)
+    entry = topic_entry(registry, topic)
+    if entry is None or is_archived_registry_entry(entry):
+        raise SystemExit(f"active topic not found: {topic}")
+    path = active_topic_path(hub, topic, entry)
+    if not is_initialized_topic(path):
+        raise SystemExit(f"active topic path is not initialized: {path}")
+    return entry, path
+
+
+def specialist_list(args: argparse.Namespace) -> int:
+    hub = resolve_hub(args)
+    require_initialized_hub(hub)
+    if args.wiki:
+        issues = collect_specialist_issues(hub)
+        if issues:
+            raise SystemExit(
+                "specialist library is invalid; run specialist validate before topic selection"
+            )
+    registry = read_specialist_registry(hub)
+    rows = specialist_rows(hub, registry)
+    if args.wiki:
+        active_topic_entry(hub, args.wiki)
+        enabled = set(registry.get("topics", {}).get(args.wiki, []))
+        rows = [row for row in rows if row["name"] in enabled]
+    report = {"hub": str(hub), "wiki": args.wiki, "specialists": rows}
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+    label = f" enabled for {args.wiki}" if args.wiki else ""
+    print(f"Specialists{label}: {len(rows)}")
+    for row in rows:
+        topics = ", ".join(row["enabled_topics"]) or "not enabled"
+        print(
+            f"- {row['name']} v{row['version'] or '?'} [{row['risk_tier'] or '?'}] "
+            f"— {row['description']} ({topics})"
+        )
+    return 0
+
+
+def specialist_show(args: argparse.Namespace) -> int:
+    validate_specialist_name(args.name)
+    hub = resolve_hub(args)
+    require_initialized_hub(hub)
+    path = specialist_library_path(hub) / args.name / "SKILL.md"
+    if not path.is_file() or path.is_symlink():
+        raise SystemExit(f"specialist not found: {args.name}")
+    record = read_specialist_record(path)
+    registry = read_specialist_registry(hub)
+    record["enabled_topics"] = enabled_specialist_topics(registry, record["name"])
+    if args.json:
+        print(json.dumps(record, indent=2, sort_keys=True))
+    else:
+        print(path.read_text(encoding="utf-8"), end="")
+    return 0
+
+
+def specialist_validate(args: argparse.Namespace) -> int:
+    hub = resolve_hub(args)
+    require_initialized_hub(hub)
+    issues = collect_specialist_issues(hub, args.name)
+    report = {
+        "status": "pass" if not issues else "fail",
+        "hub": str(hub),
+        "specialist": args.name,
+        "issues": issues,
+    }
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        target = args.name or "library"
+        print(f"llm-wiki specialist validate: {target}")
+        if issues:
+            for issue in issues:
+                print(f"- Critical: {issue['message']} ({issue['path']})")
+            print(f"Result: FAIL ({len(issues)} findings)")
+        else:
+            print("Findings: none")
+            print("Result: PASS")
+    return 1 if issues else 0
+
+
+def set_specialist_enabled(args: argparse.Namespace, enabled: bool) -> int:
+    validate_specialist_name(args.name)
+    hub = resolve_hub(args)
+    _, topic_path = active_topic_entry(hub, args.wiki)
+    if enabled:
+        initialize_specialist_library(hub)
+        package = specialist_library_path(hub) / args.name
+        issues = validate_specialist_package(hub, package, args.name)
+        if issues:
+            raise SystemExit(
+                f"specialist {args.name} is missing or invalid; run specialist validate {args.name}"
+            )
+    registry = read_specialist_registry(hub)
+    topics = registry.setdefault("topics", {})
+    names = topics.setdefault(args.wiki, [])
+    if not isinstance(names, list):
+        raise SystemExit(f"invalid specialist allowlist for topic: {args.wiki}")
+    changed = False
+    if enabled and args.name not in names:
+        names.append(args.name)
+        names.sort()
+        changed = True
+    if not enabled and args.name in names:
+        names.remove(args.name)
+        changed = True
+        if not names:
+            topics.pop(args.wiki, None)
+    operation = "enabled" if enabled else "disabled"
+    if changed:
+        write_specialist_registry(hub, registry)
+        write_specialist_index(hub, registry)
+        append_log(hub, "specialist", f"{operation} {args.name} for topic {args.wiki}")
+        append_log(topic_path, "specialist", f"{operation} {args.name}")
+    report = {
+        "status": operation if changed else "unchanged",
+        "name": args.name,
+        "wiki": args.wiki,
+    }
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        if changed:
+            print(f"{operation.title()} {args.name} for {args.wiki}.")
+        else:
+            print(f"No change: {args.name} is already {operation} for {args.wiki}.")
+    return 0
+
+
+def specialist_enable(args: argparse.Namespace) -> int:
+    return set_specialist_enabled(args, True)
+
+
+def specialist_disable(args: argparse.Namespace) -> int:
+    return set_specialist_enabled(args, False)
+
+
+def run_specialist(args: argparse.Namespace) -> int:
+    handlers = {
+        "init": specialist_init,
+        "create": specialist_create,
+        "refresh": specialist_refresh,
+        "list": specialist_list,
+        "show": specialist_show,
+        "validate": specialist_validate,
+        "enable": specialist_enable,
+        "disable": specialist_disable,
+    }
+    return handlers[args.specialist_command](args)
+
+
+def adapter_config_dir() -> Path:
+    override = os.environ.get("LLM_WIKI_CONFIG_DIR")
+    if override:
+        return expand_leading_tilde(override)
+    return Path.home() / ".config" / "llm-wiki"
+
+
+def adapter_registry_path() -> Path:
+    return adapter_config_dir() / "adapters.json"
+
+
+def empty_adapter_registry() -> dict[str, Any]:
+    return {"schema_version": ADAPTER_REGISTRY_SCHEMA, "adapters": {}}
+
+
+def read_adapter_registry() -> dict[str, Any]:
+    path = adapter_registry_path()
+    if not path.exists():
+        return empty_adapter_registry()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SystemExit(f"could not read adapter registry {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid adapter registry {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit(f"invalid adapter registry {path}: root must be an object")
+    if data.get("schema_version") != ADAPTER_REGISTRY_SCHEMA:
+        raise SystemExit(
+            f"unsupported adapter registry schema in {path}: "
+            f"expected {ADAPTER_REGISTRY_SCHEMA}"
+        )
+    if not isinstance(data.get("adapters"), dict):
+        raise SystemExit(f"invalid adapter registry {path}: adapters must be an object")
+    return data
+
+
+def write_adapter_registry(data: dict[str, Any]) -> None:
+    path = adapter_registry_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    temporary = Path(handle.name)
+    try:
+        json.dump(data, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+        path.chmod(0o600)
+    except Exception:
+        handle.close()
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def write_private_json(path: Path, data: dict[str, Any]) -> None:
+    """Atomically write a machine-local receipt without broadening permissions."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    temporary = Path(handle.name)
+    try:
+        json.dump(data, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+        path.chmod(0o600)
+    except Exception:
+        handle.close()
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_json_object(path: Path, label: str) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SystemExit(f"could not read {label} {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid {label} {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit(f"invalid {label} {path}: root must be an object")
+    return data
+
+
+def validate_adapter_routes(
+    data: dict[str, Any], path: Path, errors: list[str]
+) -> None:
+    """Validate optional, provider-neutral intent/resource routing metadata."""
+    routes = data.get("routes", [])
+    if not isinstance(routes, list):
+        errors.append("routes must be an array")
+        return
+    route_ids: set[str] = set()
+    for index, route in enumerate(routes):
+        label = f"route {index + 1}"
+        if not isinstance(route, dict):
+            errors.append(f"{label} must be an object")
+            continue
+        route_id = route.get("id")
+        if not isinstance(route_id, str) or not re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", route_id
+        ):
+            errors.append(f"{label} id must be a lowercase hyphenated identifier")
+        elif route_id in route_ids:
+            errors.append(f"route id {route_id!r} is duplicated")
+        else:
+            route_ids.add(route_id)
+        intents = route.get("intents")
+        if not isinstance(intents, list) or not intents or not all(
+            isinstance(item, str) and re.fullmatch(r"[a-z][a-z0-9-]*", item)
+            for item in intents
+        ):
+            errors.append(f"{label} intents must be a non-empty lowercase token array")
+        elif len(intents) != len(set(intents)):
+            errors.append(f"{label} intents must not contain duplicates")
+        resource = route.get("resource")
+        if not isinstance(resource, dict):
+            errors.append(f"{label} resource must be an object")
+        else:
+            kind = resource.get("kind")
+            if kind not in ADAPTER_ROUTE_RESOURCE_KINDS:
+                errors.append(f"{label} resource kind must be url")
+            schemes = resource.get("schemes")
+            if not isinstance(schemes, list) or not schemes or not all(
+                isinstance(item, str)
+                and item == item.lower()
+                and re.fullmatch(r"[a-z][a-z0-9+.-]*", item)
+                for item in schemes
+            ):
+                errors.append(f"{label} URL schemes must be a non-empty lowercase array")
+            elif len(schemes) != len(set(schemes)):
+                errors.append(f"{label} URL schemes must not contain duplicates")
+            hosts = resource.get("hosts")
+            if not isinstance(hosts, list) or not hosts or not all(
+                isinstance(item, str)
+                and item == item.lower()
+                and re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", item)
+                for item in hosts
+            ):
+                errors.append(f"{label} URL hosts must be a non-empty exact-host array")
+            elif len(hosts) != len(set(hosts)):
+                errors.append(f"{label} URL hosts must not contain duplicates")
+            prefixes = resource.get("path_prefixes")
+            if not isinstance(prefixes, list) or not prefixes or not all(
+                isinstance(item, str)
+                and item.startswith("/")
+                and "?" not in item
+                and "#" not in item
+                for item in prefixes
+            ):
+                errors.append(
+                    f"{label} URL path_prefixes must be a non-empty absolute-path array"
+                )
+            elif len(prefixes) != len(set(prefixes)):
+                errors.append(f"{label} URL path_prefixes must not contain duplicates")
+        priority = route.get("priority", 0)
+        if isinstance(priority, bool) or not isinstance(priority, int) or not 0 <= priority <= 1000:
+            errors.append(f"{label} priority must be an integer from 0 to 1000")
+        guide = route.get("guide")
+        if not isinstance(guide, str) or not guide:
+            errors.append(f"{label} guide must be a relative file path")
+        else:
+            guide_path = Path(guide)
+            if guide_path.is_absolute() or ".." in guide_path.parts:
+                errors.append(f"{label} guide must stay inside the adapter root")
+            else:
+                resolved_guide = (path.parent / guide_path).resolve(strict=False)
+                if not path_within(resolved_guide, [path.parent.resolve(strict=False)]):
+                    errors.append(f"{label} guide must stay inside the adapter root")
+                elif not resolved_guide.is_file():
+                    errors.append(f"{label} guide does not exist: {guide}")
+
+
+def validate_adapter_manifest(data: dict[str, Any], path: Path) -> None:
+    errors: list[str] = []
+    adapter_id = data.get("id")
+    if not isinstance(adapter_id, str) or not re.fullmatch(
+        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", adapter_id
+    ):
+        errors.append("id must be a lowercase hyphenated identifier")
+    if data.get("protocol") != ADAPTER_PROTOCOL:
+        errors.append(f"protocol must be {ADAPTER_PROTOCOL!r}")
+    if not isinstance(data.get("version"), str) or not data.get("version"):
+        errors.append("version must be a non-empty string")
+    entrypoint = data.get("entrypoint")
+    if not isinstance(entrypoint, list) or not entrypoint or not all(
+        isinstance(item, str) and item for item in entrypoint
+    ):
+        errors.append("entrypoint must be a non-empty argv array")
+    if data.get("writes_wiki") is not False:
+        errors.append("writes_wiki must be false; adapters cannot write into a wiki")
+    network = data.get("network", "none")
+    if network not in {"none", "optional", "required"}:
+        errors.append("network must be none, optional, or required")
+    capabilities = data.get("capabilities")
+    if not isinstance(capabilities, list) or not capabilities or not all(
+        isinstance(item, str) and item for item in capabilities
+    ):
+        errors.append("capabilities must be a non-empty string array")
+    operations = data.get("operations")
+    if not isinstance(operations, dict) or not operations:
+        errors.append("operations must be a non-empty object")
+    else:
+        for name, operation in operations.items():
+            if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9-]*", name):
+                errors.append("operation names must be lowercase hyphenated identifiers")
+                continue
+            if not isinstance(operation, dict):
+                errors.append(f"operation {name!r} must be an object")
+                continue
+            read_arguments = operation.get("read_arguments", [])
+            if not isinstance(read_arguments, list) or not all(
+                isinstance(item, str) and item for item in read_arguments
+            ):
+                errors.append(f"operation {name!r} read_arguments must be a string array")
+            if not isinstance(operation.get("requires_output_dir", False), bool):
+                errors.append(f"operation {name!r} requires_output_dir must be boolean")
+            effects = operation.get("effects", [])
+            if not isinstance(effects, list) or not all(
+                isinstance(item, str) and item in ADAPTER_REMOTE_EFFECTS
+                for item in effects
+            ):
+                errors.append(
+                    f"operation {name!r} effects must contain only remote-read "
+                    "and/or remote-write"
+                )
+                effects = []
+            elif len(effects) != len(set(effects)):
+                errors.append(f"operation {name!r} effects must not contain duplicates")
+            remote_arguments = operation.get("remote_resource_arguments", [])
+            if not isinstance(remote_arguments, list) or not all(
+                isinstance(item, str) and item for item in remote_arguments
+            ):
+                errors.append(
+                    f"operation {name!r} remote_resource_arguments must be a string array"
+                )
+                remote_arguments = []
+            if effects and not remote_arguments:
+                errors.append(
+                    f"operation {name!r} with remote effects must declare "
+                    "remote_resource_arguments"
+                )
+            approved_plan_argument = operation.get("approved_plan_argument")
+            if "remote-write" in effects:
+                if operation.get("requires_output_dir") is not True:
+                    errors.append(
+                        f"operation {name!r} remote-write requires an output directory"
+                    )
+                if (
+                    not isinstance(approved_plan_argument, str)
+                    or not approved_plan_argument
+                    or approved_plan_argument not in read_arguments
+                ):
+                    errors.append(
+                        f"operation {name!r} remote-write approved_plan_argument must "
+                        "name one of its read_arguments"
+                    )
+            elif approved_plan_argument is not None:
+                errors.append(
+                    f"operation {name!r} approved_plan_argument is only valid for remote-write"
+                )
+    output_classes = data.get("output_classes", [])
+    if not isinstance(output_classes, list) or not set(output_classes).issubset(
+        ADAPTER_ARTIFACT_CLASSES
+    ):
+        errors.append(
+            "output_classes must contain only wiki-safe, private, and/or bulk"
+        )
+    validate_adapter_routes(data, path, errors)
+    if errors:
+        raise SystemExit(
+            f"invalid adapter manifest {path}: " + "; ".join(sorted(set(errors)))
+        )
+
+
+def read_adapter_manifest(root: Path) -> tuple[Path, dict[str, Any]]:
+    path = root / ADAPTER_MANIFEST_NAME
+    if not path.is_file():
+        raise SystemExit(f"adapter manifest not found: {path}")
+    data = load_json_object(path, "adapter manifest")
+    validate_adapter_manifest(data, path)
+    return path, data
+
+
+def normalized_absolute_path(value: str) -> Path:
+    return expand_leading_tilde(value).resolve(strict=False)
+
+
+def resolve_adapter_command(root: Path, entrypoint: list[str]) -> list[str]:
+    command = list(entrypoint)
+    executable = Path(command[0])
+    if executable.is_absolute():
+        command[0] = os.path.abspath(executable)
+    elif "/" in command[0] or command[0].startswith("."):
+        # Do not dereference the final executable symlink. Python virtual
+        # environments rely on being invoked through .venv/bin/python so the
+        # interpreter discovers pyvenv.cfg and its installed dependencies.
+        command[0] = os.path.abspath(root / executable)
+    else:
+        resolved = shutil.which(command[0])
+        if resolved:
+            command[0] = resolved
+    return command
+
+
+def registered_adapter(registry: dict[str, Any], adapter_id: str) -> dict[str, Any]:
+    entry = registry.get("adapters", {}).get(adapter_id)
+    if not isinstance(entry, dict):
+        raise SystemExit(f"adapter is not registered: {adapter_id}")
+    return entry
+
+
+def path_within(path: Path, roots: list[Path]) -> bool:
+    return any(path == root or root in path.parents for root in roots)
+
+
+def adapter_environment(entry: dict[str, Any]) -> dict[str, str]:
+    names = {
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+    }
+    names.update(str(item) for item in entry.get("env_allow", []))
+    environment = {name: os.environ[name] for name in names if name in os.environ}
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PYTHONUTF8"] = "1"
+    environment["LLM_WIKI_ADAPTER_ROOT"] = str(entry["root"])
+    return environment
+
+
+def run_adapter_process(
+    entry: dict[str, Any], arguments: list[str], timeout: int
+) -> subprocess.CompletedProcess[str]:
+    if timeout <= 0:
+        raise SystemExit("adapter timeout must be greater than zero")
+    command = [str(item) for item in entry["command"]] + arguments
+    try:
+        return subprocess.run(
+            command,
+            cwd=str(entry["root"]),
+            env=adapter_environment(entry),
+            text=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SystemExit(f"adapter timed out after {timeout} seconds") from exc
+    except OSError as exc:
+        raise SystemExit(f"could not execute registered adapter: {exc}") from exc
+
+
+def adapter_public_entry(adapter_id: str, entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": adapter_id,
+        "version": entry.get("version"),
+        "capabilities": entry.get("capabilities", []),
+        "distribution": entry.get("distribution", "private"),
+        "network": entry.get("network", "none"),
+        "route_count": len(entry.get("routes", [])),
+        "remote_resource_count": len(entry.get("remote_resources", [])),
+        "root": entry.get("root"),
+        "registered_at": entry.get("registered_at"),
+    }
+
+
+def adapter_add(args: argparse.Namespace) -> int:
+    root = normalized_absolute_path(args.path)
+    if not root.is_dir():
+        raise SystemExit(f"adapter root is not a directory: {root}")
+    manifest_path, manifest = read_adapter_manifest(root)
+    adapter_id = str(manifest["id"])
+    registry = read_adapter_registry()
+    if adapter_id in registry["adapters"] and not args.replace:
+        raise SystemExit(
+            f"adapter is already registered: {adapter_id}; use --replace to update it"
+        )
+    read_roots = {root}
+    read_roots.update(normalized_absolute_path(value) for value in args.read_root)
+    write_roots = {
+        normalized_absolute_path(value) for value in args.write_root
+    }
+    command = resolve_adapter_command(root, list(manifest["entrypoint"]))
+    remote_resources = sorted(set(args.remote_resource))
+    for resource in remote_resources:
+        if not isinstance(resource, str) or not resource or any(
+            character.isspace() for character in resource
+        ) or ":" not in resource:
+            raise SystemExit(
+                "remote resources must be exact non-whitespace values with a scheme prefix"
+            )
+    entry = {
+        "root": str(root),
+        "command": command,
+        "version": manifest["version"],
+        "capabilities": manifest["capabilities"],
+        "distribution": manifest.get("distribution", "private"),
+        "network": manifest.get("network", "none"),
+        "routes": manifest.get("routes", []),
+        "read_roots": sorted(str(path) for path in read_roots),
+        "write_roots": sorted(str(path) for path in write_roots),
+        "remote_resources": remote_resources,
+        "env_allow": sorted(set(args.env)),
+        "manifest_sha256": file_sha256(manifest_path),
+        "registered_at": today_date().isoformat(),
+    }
+    registry["adapters"][adapter_id] = entry
+    write_adapter_registry(registry)
+    report = adapter_public_entry(adapter_id, entry)
+    report.update(
+        {
+            "status": "registered",
+            "registry": str(adapter_registry_path()),
+            "read_roots": entry["read_roots"],
+            "write_roots": entry["write_roots"],
+            "remote_resource_count": len(entry["remote_resources"]),
+        }
+    )
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(f"Registered adapter: {adapter_id} {entry['version']}")
+        print(f"Registry: {adapter_registry_path()}")
+        print("Trust: explicit local registration; no repository was cloned or published.")
+    return 0
+
+
+def adapter_list(args: argparse.Namespace) -> int:
+    registry = read_adapter_registry()
+    entries = [
+        adapter_public_entry(adapter_id, entry)
+        for adapter_id, entry in sorted(registry["adapters"].items())
+        if isinstance(entry, dict)
+    ]
+    if args.json:
+        print(json.dumps({"adapters": entries}, indent=2, sort_keys=True))
+    elif not entries:
+        print("No private adapters registered.")
+    else:
+        for entry in entries:
+            capabilities = ",".join(entry["capabilities"])
+            print(
+                f"{entry['id']}\t{entry['version']}\t{entry['network']}\t"
+                f"{capabilities}\t{entry['root']}"
+            )
+    return 0
+
+
+def adapter_show(args: argparse.Namespace) -> int:
+    registry = read_adapter_registry()
+    entry = registered_adapter(registry, args.adapter_id)
+    report = dict(entry)
+    report["id"] = args.adapter_id
+    report["registry"] = str(adapter_registry_path())
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def adapter_route_matches(route: dict[str, Any], intent: str, resource: str) -> bool:
+    if intent not in route.get("intents", []):
+        return False
+    resource_spec = route.get("resource")
+    if not isinstance(resource_spec, dict):
+        return False
+    if resource_spec.get("kind") != "url":
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(resource)
+        port = parsed.port
+    except ValueError:
+        return False
+    if not parsed.scheme or not parsed.hostname or parsed.username or parsed.password:
+        return False
+    if port is not None:
+        return False
+    path = parsed.path or "/"
+    schemes = resource_spec.get("schemes")
+    hosts = resource_spec.get("hosts")
+    prefixes = resource_spec.get("path_prefixes")
+    if not all(isinstance(items, list) for items in (schemes, hosts, prefixes)):
+        return False
+    return (
+        parsed.scheme.lower() in schemes
+        and parsed.hostname.lower() in hosts
+        and any(isinstance(prefix, str) and path.startswith(prefix) for prefix in prefixes)
+    )
+
+
+def adapter_route(args: argparse.Namespace) -> int:
+    """Resolve an effect and resource through registered manifest routes."""
+    intent = args.intent.strip().lower()
+    if not re.fullmatch(r"[a-z][a-z0-9-]*", intent):
+        raise SystemExit("route intent must be one lowercase token")
+    registry = read_adapter_registry()
+    candidates: list[dict[str, Any]] = []
+    unavailable: list[dict[str, Any]] = []
+    for adapter_id, entry in sorted(registry["adapters"].items()):
+        if not isinstance(entry, dict):
+            continue
+        for route in entry.get("routes", []):
+            if not isinstance(route, dict) or not adapter_route_matches(
+                route, intent, args.resource
+            ):
+                continue
+            root = Path(str(entry.get("root", ""))).resolve(strict=False)
+            manifest_path = root / ADAPTER_MANIFEST_NAME
+            if not manifest_path.is_file():
+                unavailable.append({
+                    "adapter_id": adapter_id,
+                    "route_id": route.get("id"),
+                    "priority": route.get("priority", 0),
+                    "issue": "manifest missing",
+                })
+                continue
+            if file_sha256(manifest_path) != entry.get("manifest_sha256"):
+                unavailable.append({
+                    "adapter_id": adapter_id,
+                    "route_id": route.get("id"),
+                    "priority": route.get("priority", 0),
+                    "issue": "manifest changed",
+                })
+                continue
+            guide = (root / str(route["guide"])).resolve(strict=False)
+            if not guide.is_file() or not path_within(guide, [root]):
+                unavailable.append({
+                    "adapter_id": adapter_id,
+                    "route_id": route.get("id"),
+                    "priority": route.get("priority", 0),
+                    "issue": "route guide missing",
+                })
+                continue
+            candidates.append(
+                {
+                    "adapter_id": adapter_id,
+                    "route_id": route["id"],
+                    "priority": route.get("priority", 0),
+                    "guide": str(guide),
+                }
+            )
+    all_matches = candidates + unavailable
+    if all_matches:
+        highest_priority = max(int(item["priority"]) for item in all_matches)
+    else:
+        highest_priority = -1
+    blocking_unavailable = [
+        item for item in unavailable if int(item["priority"]) == highest_priority
+    ]
+    if blocking_unavailable:
+        report = {
+            "status": "unavailable",
+            "intent": intent,
+            "resource_kind": "url",
+            "issues": blocking_unavailable,
+        }
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            print("A matching adapter route is unavailable; run adapter doctor.")
+        return 2
+    if not candidates:
+        report = {
+            "status": "no-match",
+            "intent": intent,
+            "resource_kind": "url",
+        }
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            print("No registered adapter route matched.")
+        return 1
+    winners = [
+        candidate for candidate in candidates
+        if int(candidate["priority"]) == highest_priority
+    ]
+    if len(winners) != 1:
+        report = {
+            "status": "ambiguous",
+            "intent": intent,
+            "resource_kind": "url",
+            "matches": winners,
+        }
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            print("Multiple registered adapter routes matched at the same priority.")
+        return 2
+    report = {
+        "status": "matched",
+        "intent": intent,
+        "resource_kind": "url",
+        **winners[0],
+    }
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(
+            f"{report['adapter_id']}\t{report['route_id']}\t{report['guide']}"
+        )
+    return 0
+
+
+def adapter_doctor(args: argparse.Namespace) -> int:
+    registry = read_adapter_registry()
+    entry = registered_adapter(registry, args.adapter_id)
+    issues: list[str] = []
+    root = Path(str(entry.get("root", ""))).resolve(strict=False)
+    manifest_path = root / ADAPTER_MANIFEST_NAME
+    manifest: dict[str, Any] | None = None
+    if not root.is_dir():
+        issues.append("registered root is missing")
+    elif not manifest_path.is_file():
+        issues.append("adapter manifest is missing")
+    else:
+        try:
+            manifest = load_json_object(manifest_path, "adapter manifest")
+            validate_adapter_manifest(manifest, manifest_path)
+        except SystemExit as exc:
+            issues.append(str(exc))
+        if file_sha256(manifest_path) != entry.get("manifest_sha256"):
+            issues.append("adapter manifest changed; re-register with --replace")
+    command = entry.get("command")
+    if not isinstance(command, list) or not command:
+        issues.append("registered command is invalid")
+    elif not Path(str(command[0])).is_file():
+        issues.append("registered executable is missing")
+    handshake: dict[str, Any] | None = None
+    if not issues:
+        result = run_adapter_process(entry, ["describe"], args.timeout)
+        if result.returncode != 0:
+            issues.append(f"describe handshake failed with exit {result.returncode}")
+        else:
+            try:
+                parsed = json.loads(result.stdout)
+                handshake = parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                handshake = None
+            if handshake is None:
+                issues.append("describe handshake did not return one JSON object")
+            else:
+                for field in ("protocol", "id", "version", "capabilities"):
+                    if manifest is not None and handshake.get(field) != manifest.get(field):
+                        issues.append(f"describe handshake disagrees on {field}")
+    report = {
+        "id": args.adapter_id,
+        "status": "healthy" if not issues else "unhealthy",
+        "issues": issues,
+        "root": str(root),
+        "protocol": ADAPTER_PROTOCOL,
+        "handshake": handshake,
+    }
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(f"Adapter {args.adapter_id}: {report['status']}")
+        for issue in issues:
+            print(f"- {issue}")
+    return 0 if not issues else 1
+
+
+def validate_adapter_request(
+    request: dict[str, Any], adapter_id: str, manifest: dict[str, Any],
+    entry: dict[str, Any], approved_plan_sha256: str | None,
+) -> tuple[str, Path | None, dict[str, Any]]:
+    if request.get("protocol") != ADAPTER_PROTOCOL:
+        raise SystemExit(f"request protocol must be {ADAPTER_PROTOCOL!r}")
+    if request.get("adapter_id") != adapter_id:
+        raise SystemExit(f"request adapter_id must be {adapter_id!r}")
+    operation = request.get("operation")
+    operations = manifest["operations"]
+    if not isinstance(operation, str) or operation not in operations:
+        raise SystemExit(f"request operation is not supported by {adapter_id}")
+    arguments = request.get("arguments")
+    if not isinstance(arguments, dict):
+        raise SystemExit("request arguments must be an object")
+    if not isinstance(request.get("options", {}), dict):
+        raise SystemExit("request options must be an object")
+    read_roots = [Path(value).resolve(strict=False) for value in entry["read_roots"]]
+    operation_spec = operations[operation]
+    effects = set(operation_spec.get("effects", []))
+    for name in operation_spec.get("read_arguments", []):
+        raw_path = arguments.get(name)
+        if not isinstance(raw_path, str) or not raw_path:
+            raise SystemExit(f"request argument {name!r} must be an absolute path")
+        path = Path(raw_path)
+        if not path.is_absolute():
+            raise SystemExit(f"request argument {name!r} must be an absolute path")
+        resolved = path.resolve(strict=False)
+        if not resolved.exists():
+            raise SystemExit(f"request argument {name!r} does not exist")
+        if not path_within(resolved, read_roots):
+            raise SystemExit(f"request argument {name!r} is outside registered read roots")
+    output_dir: Path | None = None
+    if operation_spec.get("requires_output_dir", False):
+        raw_output = request.get("output_dir")
+        if not isinstance(raw_output, str) or not raw_output:
+            raise SystemExit("request output_dir must be an absolute path")
+        candidate = Path(raw_output)
+        if not candidate.is_absolute():
+            raise SystemExit("request output_dir must be an absolute path")
+        output_dir = candidate.resolve(strict=False)
+        write_roots = [Path(value).resolve(strict=False) for value in entry["write_roots"]]
+        if not write_roots or not path_within(output_dir, write_roots):
+            raise SystemExit("request output_dir is outside registered write roots")
+    allowed_remote_resources = set(entry.get("remote_resources", []))
+    remote_resources: list[str] = []
+    for name in operation_spec.get("remote_resource_arguments", []):
+        resource = arguments.get(name)
+        if not isinstance(resource, str) or not resource:
+            raise SystemExit(f"request argument {name!r} must be a remote resource string")
+        if resource not in allowed_remote_resources:
+            raise SystemExit(
+                f"request argument {name!r} is outside registered remote resources"
+            )
+        remote_resources.append(resource)
+    governance: dict[str, Any] = {
+        "effects": sorted(effects),
+        "remote_resources": remote_resources,
+    }
+    remote_write = request.get("remote_write")
+    if "remote-write" not in effects:
+        if remote_write is not None:
+            raise SystemExit("request remote_write is only valid for a remote-write operation")
+        if approved_plan_sha256 is not None:
+            raise SystemExit(
+                "--approve-remote-write is only valid for a remote-write operation"
+            )
+        return operation, output_dir, governance
+    if not isinstance(remote_write, dict):
+        raise SystemExit("remote-write request must include a remote_write object")
+    plan_sha256 = remote_write.get("plan_sha256")
+    if not isinstance(plan_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", plan_sha256):
+        raise SystemExit("remote_write plan_sha256 must be 64 lowercase hex characters")
+    plan_argument = operation_spec["approved_plan_argument"]
+    plan_path = Path(str(arguments[plan_argument])).resolve(strict=False)
+    actual_plan_sha256 = file_sha256(plan_path)
+    if plan_sha256 != actual_plan_sha256:
+        raise SystemExit("remote_write plan_sha256 does not match the approved plan file")
+    if approved_plan_sha256 is None:
+        raise SystemExit(
+            "remote-write operation requires --approve-remote-write with the exact plan sha256"
+        )
+    if approved_plan_sha256 != plan_sha256:
+        raise SystemExit("--approve-remote-write does not match remote_write plan_sha256")
+    idempotency_key = remote_write.get("idempotency_key")
+    if (
+        not isinstance(idempotency_key, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}", idempotency_key)
+    ):
+        raise SystemExit(
+            "remote_write idempotency_key must be 8-128 safe identifier characters"
+        )
+    expected_revision = remote_write.get("expected_revision")
+    if not isinstance(expected_revision, str) or not expected_revision:
+        raise SystemExit("remote_write expected_revision must be a non-empty string")
+    governance["remote_write"] = {
+        "plan_sha256": plan_sha256,
+        "idempotency_key": idempotency_key,
+        "expected_revision": expected_revision,
+    }
+    return operation, output_dir, governance
+
+
+def validate_adapter_response(
+    response: dict[str, Any], adapter_id: str, operation: str,
+    manifest: dict[str, Any], entry: dict[str, Any], output_dir: Path | None,
+    governance: dict[str, Any],
+) -> None:
+    if response.get("protocol") != ADAPTER_PROTOCOL:
+        raise SystemExit("adapter response has the wrong protocol")
+    if response.get("adapter_id") != adapter_id:
+        raise SystemExit("adapter response has the wrong adapter_id")
+    if response.get("operation") != operation:
+        raise SystemExit("adapter response has the wrong operation")
+    if response.get("adapter_version") != manifest.get("version"):
+        raise SystemExit("adapter response has the wrong adapter_version")
+    if response.get("status") not in {"ok", "error"}:
+        raise SystemExit("adapter response status must be ok or error")
+    if not isinstance(response.get("summary"), dict):
+        raise SystemExit("adapter response summary must be an object")
+    if response["status"] == "ok" and not isinstance(response.get("run_id"), str):
+        raise SystemExit("successful adapter response run_id must be a string")
+    if response["status"] == "error":
+        errors = response.get("errors")
+        if not isinstance(errors, list) or not errors or not all(
+            isinstance(item, str) and item for item in errors
+        ):
+            raise SystemExit("failed adapter response errors must be a non-empty string array")
+    artifacts = response.get("artifacts", [])
+    if not isinstance(artifacts, list):
+        raise SystemExit("adapter response artifacts must be an array")
+    allowed_classes = set(manifest.get("output_classes", []))
+    write_roots = [Path(value).resolve(strict=False) for value in entry["write_roots"]]
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            raise SystemExit("adapter response artifact must be an object")
+        raw_path = artifact.get("path")
+        artifact_class = artifact.get("class")
+        expected_sha = artifact.get("sha256")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise SystemExit("adapter response artifact path is missing")
+        if artifact_class not in allowed_classes:
+            raise SystemExit("adapter response artifact has an undeclared class")
+        if not isinstance(expected_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+            raise SystemExit("adapter response artifact sha256 is invalid")
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            if output_dir is None:
+                raise SystemExit("relative adapter artifact requires output_dir")
+            candidate = output_dir / candidate
+        resolved = candidate.resolve(strict=False)
+        if not resolved.is_file():
+            raise SystemExit("adapter response artifact does not exist as a file")
+        if not path_within(resolved, write_roots):
+            raise SystemExit("adapter response artifact is outside registered write roots")
+        if output_dir is not None and not path_within(resolved, [output_dir]):
+            raise SystemExit("adapter response artifact is outside the request output_dir")
+        if file_sha256(resolved) != expected_sha:
+            raise SystemExit("adapter response artifact sha256 does not match")
+    remote_write = governance.get("remote_write")
+    remote_receipt = response.get("remote_receipt")
+    if remote_write is None:
+        if remote_receipt is not None:
+            raise SystemExit(
+                "adapter response remote_receipt is only valid for a remote-write operation"
+            )
+        return
+    if remote_receipt is None and response["status"] == "error":
+        return
+    if not isinstance(remote_receipt, dict):
+        raise SystemExit("successful remote-write response must include remote_receipt")
+    if remote_receipt.get("resources") != governance["remote_resources"]:
+        raise SystemExit("remote receipt resources do not match the approved request")
+    if remote_receipt.get("plan_sha256") != remote_write["plan_sha256"]:
+        raise SystemExit("remote receipt plan_sha256 does not match the approved request")
+    if remote_receipt.get("idempotency_key") != remote_write["idempotency_key"]:
+        raise SystemExit("remote receipt idempotency_key does not match the approved request")
+    if remote_receipt.get("before_revision") != remote_write["expected_revision"]:
+        raise SystemExit("remote receipt before_revision does not match the approved request")
+    if not isinstance(remote_receipt.get("after_revision"), str) or not remote_receipt.get(
+        "after_revision"
+    ):
+        raise SystemExit("remote receipt after_revision must be a non-empty string")
+    verification = remote_receipt.get("verification")
+    if not isinstance(verification, dict):
+        raise SystemExit("remote receipt verification must be an object")
+    if response["status"] == "ok" and (
+        remote_receipt.get("status") != "verified"
+        or verification.get("status") != "verified"
+    ):
+        raise SystemExit("successful remote-write response must be verified")
+
+
+def redacted_remote_write_report(response: dict[str, Any]) -> dict[str, Any]:
+    """Return a content- and identifier-free terminal report for remote writes."""
+    receipt = response.get("remote_receipt")
+    resource_count = len(receipt.get("resources", [])) if isinstance(receipt, dict) else 0
+    return {
+        "protocol": response.get("protocol"),
+        "adapter_id": response.get("adapter_id"),
+        "adapter_version": response.get("adapter_version"),
+        "operation": response.get("operation"),
+        "status": response.get("status"),
+        "artifact_count": len(response.get("artifacts", [])),
+        "remote_write": {
+            "status": receipt.get("status") if isinstance(receipt, dict) else "failed",
+            "resource_count": resource_count,
+            "verified": bool(
+                isinstance(receipt, dict)
+                and isinstance(receipt.get("verification"), dict)
+                and receipt["verification"].get("status") == "verified"
+            ),
+        },
+    }
+
+
+def adapter_run(args: argparse.Namespace) -> int:
+    registry = read_adapter_registry()
+    entry = registered_adapter(registry, args.adapter_id)
+    root = Path(entry["root"]).resolve(strict=False)
+    manifest_path, manifest = read_adapter_manifest(root)
+    if file_sha256(manifest_path) != entry.get("manifest_sha256"):
+        raise SystemExit("adapter manifest changed; re-register with --replace")
+    request_path = normalized_absolute_path(args.request)
+    request = load_json_object(request_path, "adapter request")
+    operation, output_dir, governance = validate_adapter_request(
+        request, args.adapter_id, manifest, entry, args.approve_remote_write
+    )
+    remote_write_operation = "remote-write" in governance.get("effects", [])
+    if remote_write_operation and not args.response:
+        raise SystemExit("remote-write operation requires --response for a private receipt")
+    response_destination: Path | None = None
+    if args.response:
+        response_destination = normalized_absolute_path(args.response)
+        if remote_write_operation:
+            write_roots = [Path(value).resolve(strict=False) for value in entry["write_roots"]]
+            if not write_roots or not path_within(response_destination, write_roots):
+                raise SystemExit("remote-write response receipt is outside registered write roots")
+    with tempfile.TemporaryDirectory(prefix="llm-wiki-adapter-") as temporary:
+        response_path = Path(temporary) / "response.json"
+        result = run_adapter_process(
+            entry,
+            ["execute", "--request", str(request_path), "--response", str(response_path)],
+            args.timeout,
+        )
+        if not response_path.is_file():
+            raise SystemExit(
+                f"adapter exited {result.returncode} without a response document"
+            )
+        response = load_json_object(response_path, "adapter response")
+    validate_adapter_response(
+        response, args.adapter_id, operation, manifest, entry, output_dir, governance
+    )
+    if response_destination is not None:
+        write_private_json(response_destination, response)
+    if args.json:
+        report = redacted_remote_write_report(response) if remote_write_operation else response
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(
+            f"Adapter {args.adapter_id} {operation}: {response['status']} "
+            f"({len(response.get('artifacts', []))} verified artifacts)"
+        )
+        print("No artifacts were imported into the wiki automatically.")
+    if result.returncode != 0 or response["status"] != "ok":
+        return 2
+    return 0
+
+
+def adapter_remove(args: argparse.Namespace) -> int:
+    registry = read_adapter_registry()
+    registered_adapter(registry, args.adapter_id)
+    if not args.yes:
+        raise SystemExit("adapter remove requires --yes")
+    del registry["adapters"][args.adapter_id]
+    write_adapter_registry(registry)
+    report = {"id": args.adapter_id, "status": "removed"}
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(f"Removed adapter registration: {args.adapter_id}")
+    return 0
+
+
+def run_adapter(args: argparse.Namespace) -> int:
+    handlers = {
+        "add": adapter_add,
+        "list": adapter_list,
+        "show": adapter_show,
+        "route": adapter_route,
+        "doctor": adapter_doctor,
+        "run": adapter_run,
+        "remove": adapter_remove,
+    }
+    return handlers[args.adapter_command](args)
+
+
+def checkpoint_pattern_specs() -> list[tuple[str, str, str, re.Pattern[str]]]:
+    flags = re.IGNORECASE | re.MULTILINE
+    return [
+        (
+            "secret-private-key",
+            "critical",
+            "Possible private-key material.",
+            re.compile(
+                r"-----BEGIN (?:(?:[A-Z0-9 ]+ )?PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----",
+                flags,
+            ),
+        ),
+        (
+            "secret-known-token",
+            "critical",
+            "Possible service credential or bearer token.",
+            re.compile(
+                r"(?:\bAKIA[0-9A-Z]{16}\b|\bgh[pousr]_[A-Za-z0-9]{20,}\b|"
+                r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b|\bsk-[A-Za-z0-9_-]{16,}\b|"
+                r"\bAIza[0-9A-Za-z_-]{25,}\b|\bBearer\s+[A-Za-z0-9._~+/=-]{12,}|"
+                r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)",
+                flags,
+            ),
+        ),
+        (
+            "secret-assignment",
+            "critical",
+            "Possible credential assigned to a sensitive field.",
+            re.compile(
+                r"\b(?:api[_-]?key|private[_-]?key|(?:access|auth|api|refresh)?[_-]?token|"
+                r"client[_-]?secret|password|passwd|secret|session[_-]?cookie)\b"
+                r"\s*[\"']?\s*[:=]\s*"
+                r"[\"']?[A-Za-z0-9_./+=$~-]{8,}",
+                flags,
+            ),
+        ),
+        (
+            "secret-url-credentials",
+            "critical",
+            "Possible username/password embedded in a URL.",
+            re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@", flags),
+        ),
+        (
+            "personal-email",
+            "warning",
+            "Email address may identify a person or private account.",
+            re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+        ),
+        (
+            "personal-account-field",
+            "warning",
+            "Account or username field may expose an identity.",
+            re.compile(
+                r"^[ \t]*[\"']?(?:user(?:name)?|login|account(?:[_-]?name)?|handle)"
+                r"[\"']?[ \t]*[:=][ \t]*[\"']?@?[A-Za-z0-9_.-]{2,}",
+                flags,
+            ),
+        ),
+        (
+            "local-home-path",
+            "critical",
+            "Machine-local home directory path.",
+            re.compile(
+                r"(?:(?<![:A-Za-z0-9])/Users/[A-Za-z0-9._-]+(?:/|\b)|"
+                r"(?<![:A-Za-z0-9])/home/[A-Za-z0-9._-]+(?:/|\b)|"
+                r"(?<![:A-Za-z0-9])/root(?:/|\b)|[A-Za-z]:\\Users\\[A-Za-z0-9._ -]+(?:\\|\b))",
+                flags,
+            ),
+        ),
+        (
+            "local-machine-path",
+            "critical",
+            "Machine-local volume, temporary, or file URL path.",
+            re.compile(
+                r"(?:file://|(?:~|\$HOME|\$\{HOME\})/|(?<![:A-Za-z0-9])/Volumes/[^\s/]+(?:/|\b)|"
+                r"(?<![:A-Za-z0-9])/private/var/folders/|(?<![:A-Za-z0-9])/(?:tmp|var|etc|opt|srv|mnt|media|workspace|Applications|Library)/[^\s`\"']+)",
+                flags,
+            ),
+        ),
+        (
+            "remote-login-identity",
+            "warning",
+            "Remote-login syntax may expose a username or private host.",
+            re.compile(r"\b(?:ssh|scp|sftp|rsync)\b[^\n]*\b[A-Za-z0-9._-]+@[A-Za-z0-9._-]+", flags),
+        ),
+        (
+            "local-network-address",
+            "warning",
+            "Private-network address may reveal local infrastructure.",
+            re.compile(
+                r"\b(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|"
+                r"172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})\b"
+            ),
+        ),
+        (
+            "local-hostname",
+            "warning",
+            "Local hostname may reveal private infrastructure.",
+            re.compile(
+                r"(?:\b[A-Za-z0-9][A-Za-z0-9-]{0,62}\.local\b|"
+                r"\b[A-Za-z0-9][A-Za-z0-9.-]{0,126}\.(?:lan|internal)\b|"
+                r"^[ \t]*[\"']?hostname[\"']?[ \t]*[:=][ \t]*[\"']?[^\s\"']+)",
+                flags,
+            ),
+        ),
+        (
+            "session-transcript",
+            "critical",
+            "Session or transcript metadata must not enter a checkpoint.",
+            re.compile(
+                r"(?:transcript[_-]?path|rollout-[^\s]+\.jsonl|\.sessions/(?:digests|feedback)/|"
+                r"\b(?:codex|claude):[0-9a-f]{8}-[0-9a-f-]{27,}\b|UserPromptSubmit|PreCompact|PostCompact)",
+                flags,
+            ),
+        ),
+        (
+            "prompt-conversation-role",
+            "warning",
+            "Conversation-role content may be copied prompt or transcript text.",
+            re.compile(
+                r"(?:^[ \t]*(?:system|developer|assistant|user)[ \t]*:[ \t]+\S|"
+                r"[\"']role[\"'][ \t]*:[ \t]*[\"'](?:system|developer|assistant|user)[\"'])",
+                flags,
+            ),
+        ),
+        (
+            "prompt-instruction-marker",
+            "warning",
+            "Prompt/instruction marker may expose agent instructions.",
+            re.compile(
+                r"(?:<\|(?:system|user|assistant)\|>|\[INST\]|</?system>|"
+                r"AGENTS\.md instructions for|(?:system|developer) prompt[ \t]*:)",
+                flags,
+            ),
+        ),
+    ]
+
+
+def checkpoint_finding(
+    category: str,
+    severity: str,
+    path: str,
+    line: int,
+    message: str,
+    evidence: str,
+) -> CheckpointFinding:
+    digest = hashlib.sha256(
+        "\0".join([category, path, str(line), evidence]).encode("utf-8")
+    ).hexdigest()[:16]
+    return CheckpointFinding(
+        finding_id=f"privacy-{digest}",
+        category=category,
+        severity=severity,
+        path=path,
+        line=line,
+        message=message,
+    )
+
+
+def scan_checkpoint_text(text: str, rel: str) -> list[CheckpointFinding]:
+    findings: list[CheckpointFinding] = []
+    for category, severity, message, pattern in checkpoint_pattern_specs():
+        for match in pattern.finditer(text):
+            line = text.count("\n", 0, match.start()) + 1
+            findings.append(
+                checkpoint_finding(
+                    category,
+                    severity,
+                    rel,
+                    line,
+                    message,
+                    match.group(0),
+                )
+            )
+    return findings
+
+
+def checkpoint_file_paths(root: Path, include_report: bool = False) -> list[Path]:
+    names = set(CHECKPOINT_REQUIRED_FILES)
+    if include_report:
+        names.add(CHECKPOINT_REPORT_NAME)
+    return [root / name for name in sorted(names) if (root / name).exists() or (root / name).is_symlink()]
+
+
+def checkpoint_source_key(item: dict[str, Any]) -> str:
+    return f"{item.get('wiki', '')}:{item.get('path', '')}"
+
+
+def checkpoint_word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w][\w'-]*\b", text, flags=re.UNICODE))
+
+
+def checkpoint_coverage_metrics(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    inputs = manifest.get("inputs", [])
+    source_word_count = sum(
+        item.get("words", 0) for item in inputs if isinstance(item, dict)
+    )
+    knowledge_path = root / "project-knowledge.md"
+    try:
+        knowledge_text = knowledge_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        knowledge_text = ""
+    knowledge_word_count = checkpoint_word_count(knowledge_text)
+    retention_ratio = (
+        knowledge_word_count / source_word_count if source_word_count else 0.0
+    )
+    return {
+        "source_word_count": source_word_count,
+        "knowledge_word_count": knowledge_word_count,
+        "retention_ratio": round(retention_ratio, 4),
+        "minimum_retention_ratio": CHECKPOINT_MIN_KNOWLEDGE_RETENTION_RATIO,
+    }
+
+
+def apply_checkpoint_coverage_metrics(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    metrics = checkpoint_coverage_metrics(root, manifest)
+    if metrics["retention_ratio"] < CHECKPOINT_MIN_KNOWLEDGE_RETENTION_RATIO:
+        required_words = math.ceil(
+            metrics["source_word_count"] * CHECKPOINT_MIN_KNOWLEDGE_RETENTION_RATIO
+        )
+        raise SystemExit(
+            "project-knowledge.md is too thin for comprehensive mode: "
+            f"{metrics['knowledge_word_count']} words for "
+            f"{metrics['source_word_count']} selected-source words; "
+            f"write at least {required_words} words or reduce the selected scope"
+        )
+    coverage = manifest["coverage"]
+    for key, value in metrics.items():
+        coverage[key] = value
+    return metrics
+
+
+def checkpoint_source_access_findings(
+    manifest: dict[str, Any], audience: str
+) -> list[CheckpointFinding]:
+    inputs = manifest.get("inputs")
+    if not isinstance(inputs, list):
+        return [
+            checkpoint_finding(
+                "structure-inputs",
+                "critical",
+                "checkpoint.json",
+                1,
+                "Manifest inputs must be an array.",
+                "inputs-not-array",
+            )
+        ]
+    source_overrides = manifest.get("source_overrides", [])
+    override_keys = {
+        entry.get("source")
+        for entry in source_overrides
+        if isinstance(entry, dict)
+        and isinstance(entry.get("source"), str)
+        and isinstance(entry.get("reason"), str)
+        and entry.get("reason", "").strip()
+    }
+    allowed = {
+        "private": {"public", "team", "private"},
+        "team": {"public", "team"},
+        "public": {"public"},
+    }[audience]
+    findings: list[CheckpointFinding] = []
+    for index, item in enumerate(inputs):
+        if not isinstance(item, dict):
+            findings.append(
+                checkpoint_finding(
+                    "structure-input",
+                    "critical",
+                    "checkpoint.json",
+                    1,
+                    f"Input {index + 1} must be an object.",
+                    f"input-{index}-not-object",
+                )
+            )
+            continue
+        access = item.get("access")
+        key = checkpoint_source_key(item)
+        if access not in {"public", "team", "private", "unknown"}:
+            message = f"Input {index + 1} has no valid access classification."
+        elif access not in allowed:
+            message = f"Input {index + 1} exceeds the declared {audience} audience."
+        else:
+            continue
+        if key in override_keys:
+            continue
+        findings.append(
+            checkpoint_finding(
+                "source-access",
+                "critical",
+                "checkpoint.json",
+                1,
+                message,
+                f"{index}:{key}:{access}:{audience}",
+            )
+        )
+    return findings
+
+
+def scan_checkpoint_bundle(root: Path, audience: str) -> tuple[list[CheckpointFinding], list[dict[str, str]]]:
+    findings: list[CheckpointFinding] = []
+    files: list[dict[str, str]] = []
+    allowed_names = CHECKPOINT_REQUIRED_FILES | {CHECKPOINT_REPORT_NAME}
+    for path in sorted(root.iterdir(), key=lambda item: item.name):
+        if path.name in allowed_names:
+            continue
+        opaque_path = "unexpected-" + hashlib.sha256(path.name.encode("utf-8")).hexdigest()[:12]
+        findings.append(
+            checkpoint_finding(
+                "structure-unexpected-entry",
+                "critical",
+                opaque_path,
+                0,
+                "Checkpoint v1 contains an unexpected file or directory; its name is redacted.",
+                path.name,
+            )
+        )
+    for required in sorted(CHECKPOINT_REQUIRED_FILES):
+        if not (root / required).is_file():
+            findings.append(
+                checkpoint_finding(
+                    "structure-required-file",
+                    "critical",
+                    required,
+                    0,
+                    "Required checkpoint file is missing.",
+                    required,
+                )
+            )
+    for path in checkpoint_file_paths(root):
+        rel = path.relative_to(root).as_posix()
+        findings.extend(scan_checkpoint_text(rel, rel))
+        if path.is_symlink():
+            findings.append(
+                checkpoint_finding(
+                    "structure-symlink",
+                    "critical",
+                    rel,
+                    0,
+                    "Checkpoint bundles may not contain symbolic links.",
+                    rel,
+                )
+            )
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            findings.append(
+                checkpoint_finding(
+                    "structure-unreadable",
+                    "critical",
+                    rel,
+                    0,
+                    "Checkpoint file could not be inspected.",
+                    f"{rel}:{type(exc).__name__}",
+                )
+            )
+            continue
+        if size > CHECKPOINT_MAX_FILE_BYTES:
+            findings.append(
+                checkpoint_finding(
+                    "structure-file-size",
+                    "critical",
+                    rel,
+                    0,
+                    "Checkpoint file exceeds the 10 MiB safety limit.",
+                    f"{rel}:{size}",
+                )
+            )
+            continue
+        if path.suffix.lower() not in {".md", ".json"}:
+            findings.append(
+                checkpoint_finding(
+                    "structure-file-type",
+                    "critical",
+                    rel,
+                    0,
+                    "Checkpoint contains a non-Markdown/non-JSON file.",
+                    rel,
+                )
+            )
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            findings.append(
+                checkpoint_finding(
+                    "structure-non-text",
+                    "critical",
+                    rel,
+                    0,
+                    "Checkpoint file is unreadable or not UTF-8 text.",
+                    f"{rel}:{type(exc).__name__}",
+                )
+            )
+            continue
+        files.append({"path": rel, "sha256": file_sha256(path)})
+        findings.extend(scan_checkpoint_text(text, rel))
+
+    manifest_path = root / "checkpoint.json"
+    if manifest_path.is_file() and not manifest_path.is_symlink():
+        try:
+            manifest = load_json_object(manifest_path, "checkpoint manifest")
+        except SystemExit as exc:
+            findings.append(
+                checkpoint_finding(
+                    "structure-manifest-json",
+                    "critical",
+                    "checkpoint.json",
+                    1,
+                    "Checkpoint manifest is not a valid JSON object.",
+                    str(exc),
+                )
+            )
+        else:
+            findings.extend(checkpoint_source_access_findings(manifest, audience))
+    unique = {finding.finding_id: finding for finding in findings}
+    return (
+        sorted(unique.values(), key=lambda item: (item.path, item.line, item.category, item.finding_id)),
+        sorted(files, key=lambda item: item["path"]),
+    )
+
+
+def validate_checkpoint_manifest(manifest: dict[str, Any], audience: str) -> None:
+    if manifest.get("schema") != CHECKPOINT_SCHEMA:
+        raise SystemExit(f"checkpoint.json schema must be {CHECKPOINT_SCHEMA!r}")
+    if audience not in CHECKPOINT_AUDIENCES:
+        raise SystemExit("checkpoint audience must be private, team, or public")
+    project = manifest.get("project")
+    if not isinstance(project, dict) or not isinstance(project.get("slug"), str) or not project.get("slug"):
+        raise SystemExit("checkpoint.json project.slug must be a non-empty string")
+    if not SPECIALIST_NAME_RE.fullmatch(project["slug"]):
+        raise SystemExit("checkpoint.json project.slug must be lowercase hyphenated text")
+    if not isinstance(manifest.get("created_at"), str) or not manifest["created_at"].strip():
+        raise SystemExit("checkpoint.json created_at must be a non-empty string")
+    if not isinstance(manifest.get("scope"), dict):
+        raise SystemExit("checkpoint.json scope must be an object")
+    if not isinstance(manifest.get("inputs"), list) or not manifest["inputs"]:
+        raise SystemExit("checkpoint.json inputs must be an array")
+    if not isinstance(manifest.get("gaps"), list):
+        raise SystemExit("checkpoint.json gaps must be an array")
+    for index, item in enumerate(manifest["inputs"]):
+        if not isinstance(item, dict):
+            raise SystemExit(f"checkpoint.json input {index + 1} must be an object")
+        for field in ("wiki", "path", "sha256", "reason", "access"):
+            if not isinstance(item.get(field), str) or not item[field].strip():
+                raise SystemExit(f"checkpoint.json input {index + 1} requires {field}")
+        if not isinstance(item.get("words"), int) or item["words"] <= 0:
+            raise SystemExit(f"checkpoint.json input {index + 1} words must be a positive integer")
+        if not re.fullmatch(r"[0-9a-f]{64}", item["sha256"]):
+            raise SystemExit(f"checkpoint.json input {index + 1} sha256 must be 64 lowercase hex characters")
+        source_path = item["path"]
+        if Path(source_path).is_absolute() or ".." in Path(source_path).parts:
+            raise SystemExit(f"checkpoint.json input {index + 1} path must be wiki-relative")
+    input_keys = [checkpoint_source_key(item) for item in manifest["inputs"]]
+    if len(set(input_keys)) != len(input_keys):
+        raise SystemExit("checkpoint.json inputs must have unique wiki:path keys")
+
+    coverage = manifest.get("coverage")
+    if not isinstance(coverage, dict):
+        raise SystemExit("checkpoint.json coverage must be an object")
+    if coverage.get("mode") != "comprehensive":
+        raise SystemExit("checkpoint.json coverage.mode must be 'comprehensive'")
+    source_word_count = sum(item["words"] for item in manifest["inputs"])
+    if coverage.get("source_word_count") != source_word_count:
+        raise SystemExit("checkpoint.json coverage.source_word_count must equal input words")
+    section_map = coverage.get("section_map")
+    if not isinstance(section_map, list) or not section_map:
+        raise SystemExit("checkpoint.json coverage.section_map must be a non-empty array")
+    mapped_sources: set[str] = set()
+    valid_input_keys = set(input_keys)
+    for index, item in enumerate(section_map):
+        if not isinstance(item, dict):
+            raise SystemExit(f"checkpoint.json coverage section {index + 1} must be an object")
+        if not isinstance(item.get("section"), str) or not item["section"].strip():
+            raise SystemExit(f"checkpoint.json coverage section {index + 1} requires section")
+        sources = item.get("sources")
+        if not isinstance(sources, list) or not sources:
+            raise SystemExit(f"checkpoint.json coverage section {index + 1} requires sources")
+        if any(not isinstance(source, str) or source not in valid_input_keys for source in sources):
+            raise SystemExit(f"checkpoint.json coverage section {index + 1} names an unknown input")
+        mapped_sources.update(sources)
+    if mapped_sources != valid_input_keys:
+        raise SystemExit("checkpoint.json coverage.section_map must account for every input")
+    omissions = coverage.get("omissions")
+    if not isinstance(omissions, list):
+        raise SystemExit("checkpoint.json coverage.omissions must be an array")
+    for index, item in enumerate(omissions):
+        if not isinstance(item, dict):
+            raise SystemExit(f"checkpoint.json coverage omission {index + 1} must be an object")
+        if item.get("source") not in valid_input_keys:
+            raise SystemExit(f"checkpoint.json coverage omission {index + 1} names an unknown input")
+        for field in ("section", "reason"):
+            if not isinstance(item.get(field), str) or not item[field].strip():
+                raise SystemExit(f"checkpoint.json coverage omission {index + 1} requires {field}")
+
+    source_overrides = manifest.get("source_overrides", [])
+    if not isinstance(source_overrides, list):
+        raise SystemExit("checkpoint.json source_overrides must be an array")
+    input_keys = set(input_keys)
+    for index, item in enumerate(source_overrides):
+        if not isinstance(item, dict):
+            raise SystemExit(f"checkpoint.json source override {index + 1} must be an object")
+        if item.get("source") not in input_keys:
+            raise SystemExit(f"checkpoint.json source override {index + 1} names an unknown input")
+        if not isinstance(item.get("reason"), str) or not item["reason"].strip():
+            raise SystemExit(f"checkpoint.json source override {index + 1} requires a reason")
+
+
+def checkpoint_content_file_hashes(root: Path) -> list[dict[str, str]]:
+    values: list[dict[str, str]] = []
+    for path in checkpoint_file_paths(root):
+        rel = path.relative_to(root).as_posix()
+        if rel in {"checkpoint.json", CHECKPOINT_REPORT_NAME}:
+            continue
+        if path.is_symlink() or not path.is_file():
+            continue
+        values.append({"path": rel, "sha256": file_sha256(path)})
+    return sorted(values, key=lambda item: item["path"])
+
+
+def checkpoint_manifest_id(manifest: dict[str, Any]) -> str:
+    payload = dict(manifest)
+    payload.pop("checkpoint_id", None)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def checkpoint_report_id(report: dict[str, Any]) -> str:
+    payload = dict(report)
+    payload.pop("report_id", None)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def checkpoint_timestamp() -> str:
+    override = os.environ.get("LLM_WIKI_NOW")
+    if override:
+        return override
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def write_checkpoint_json(path: Path, value: dict[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def checkpoint_finding_json(finding: CheckpointFinding, allowed: bool) -> dict[str, Any]:
+    return {
+        "id": finding.finding_id,
+        "category": finding.category,
+        "severity": finding.severity,
+        "path": finding.path,
+        "line": finding.line,
+        "message": finding.message,
+        "status": "allowed" if allowed else "blocking",
+    }
+
+
+def validate_override_reason(reason: str | None) -> str:
+    value = (reason or "").strip()
+    if not value:
+        raise SystemExit("--override-reason is required when allowing a source or finding")
+    if len(value) > 240 or "\n" in value or "\r" in value:
+        raise SystemExit("--override-reason must be one line and no more than 240 characters")
+    if scan_checkpoint_text(value, CHECKPOINT_REPORT_NAME):
+        raise SystemExit("--override-reason itself matches a sensitive-information pattern")
+    return value
+
+
+def checkpoint_seal(args: argparse.Namespace) -> int:
+    root = Path(args.path).expanduser().resolve(strict=False)
+    if not root.is_dir():
+        raise SystemExit("checkpoint seal path must be an existing directory")
+    for name in CHECKPOINT_REQUIRED_FILES | {CHECKPOINT_REPORT_NAME}:
+        if (root / name).is_symlink():
+            raise SystemExit("checkpoint seal refuses symbolic links in the fixed bundle")
+    manifest_path = root / "checkpoint.json"
+    manifest = load_json_object(manifest_path, "checkpoint manifest")
+    validate_checkpoint_manifest(manifest, args.audience)
+
+    allowed_findings = set(args.allow_finding or [])
+    allowed_sources = set(args.allow_source or [])
+    reason: str | None = None
+    if allowed_findings or allowed_sources:
+        reason = validate_override_reason(args.override_reason)
+
+    input_keys = {
+        checkpoint_source_key(item)
+        for item in manifest.get("inputs", [])
+        if isinstance(item, dict)
+    }
+    unknown_sources = sorted(allowed_sources - input_keys)
+    if unknown_sources:
+        raise SystemExit("--allow-source names an input not present in checkpoint.json")
+    # A new seal never trusts hand-written or stale source overrides. The
+    # caller must re-authorize every retained above-audience input by exact key.
+    manifest["source_overrides"] = [
+        {"source": key, "reason": reason} for key in sorted(allowed_sources)
+    ]
+
+    manifest["audience"] = args.audience
+    coverage_metrics = apply_checkpoint_coverage_metrics(root, manifest)
+    manifest["files"] = checkpoint_content_file_hashes(root)
+    manifest["checkpoint_id"] = checkpoint_manifest_id(manifest)
+    write_checkpoint_json(manifest_path, manifest)
+
+    findings, scanned_files = scan_checkpoint_bundle(root, args.audience)
+    finding_ids = {finding.finding_id for finding in findings}
+    unknown_findings = sorted(allowed_findings - finding_ids)
+    if unknown_findings:
+        raise SystemExit("--allow-finding contains an unknown or stale finding ID")
+    blocking = [finding for finding in findings if finding.finding_id not in allowed_findings]
+    source_override_count = len(manifest.get("source_overrides", []))
+    status = "blocked" if blocking else (
+        "overridden" if findings or source_override_count else "passed"
+    )
+    overrides = [
+        {"finding_id": finding_id, "reason": reason}
+        for finding_id in sorted(allowed_findings)
+    ]
+    report: dict[str, Any] = {
+        "schema": CHECKPOINT_PRIVACY_SCHEMA,
+        "scanner_version": CHECKPOINT_SCANNER_VERSION,
+        "checkpoint_id": manifest["checkpoint_id"],
+        "audience": args.audience,
+        "scanned_at": checkpoint_timestamp(),
+        "status": status,
+        "files": scanned_files,
+        "findings": [
+            checkpoint_finding_json(finding, finding.finding_id in allowed_findings)
+            for finding in findings
+        ],
+        "overrides": overrides,
+        "source_override_count": source_override_count,
+        "coverage": coverage_metrics,
+    }
+    report["report_id"] = checkpoint_report_id(report)
+    write_checkpoint_json(root / CHECKPOINT_REPORT_NAME, report)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(
+            f"Checkpoint seal: {status} ({len(scanned_files)} files, "
+            f"{len(findings)} findings, {len(overrides)} overrides)"
+        )
+        for finding in findings:
+            print(
+                f"- {finding.finding_id} {finding.category} "
+                f"{finding.path}:{finding.line} - {finding.message}"
+            )
+    return 2 if blocking else 0
+
+
+def checkpoint_verify(args: argparse.Namespace) -> int:
+    root = Path(args.path).expanduser().resolve(strict=False)
+    errors: list[str] = []
+    if not root.is_dir():
+        raise SystemExit("checkpoint verify path must be an existing directory")
+    for name in CHECKPOINT_REQUIRED_FILES | {CHECKPOINT_REPORT_NAME}:
+        if (root / name).is_symlink():
+            result = {
+                "status": "invalid",
+                "errors": ["checkpoint verify refuses symbolic links in the fixed bundle"],
+            }
+            print(json.dumps(result, indent=2, sort_keys=True) if args.json else result["errors"][0])
+            return 2
+    try:
+        manifest = load_json_object(root / "checkpoint.json", "checkpoint manifest")
+        report = load_json_object(root / CHECKPOINT_REPORT_NAME, "checkpoint privacy report")
+    except SystemExit as exc:
+        result = {"status": "invalid", "errors": [str(exc)]}
+        print(json.dumps(result, indent=2, sort_keys=True) if args.json else str(exc))
+        return 2
+    audience = manifest.get("audience")
+    try:
+        validate_checkpoint_manifest(manifest, audience)
+    except SystemExit as exc:
+        errors.append(str(exc))
+    if report.get("schema") != CHECKPOINT_PRIVACY_SCHEMA:
+        errors.append("privacy-report.json has an unsupported schema")
+    if report.get("scanner_version") != CHECKPOINT_SCANNER_VERSION:
+        errors.append("privacy-report.json scanner version is unsupported")
+    if report.get("report_id") != checkpoint_report_id(report):
+        errors.append("privacy-report.json report_id does not match its content")
+    expected_checkpoint_id = checkpoint_manifest_id(manifest)
+    if manifest.get("checkpoint_id") != expected_checkpoint_id:
+        errors.append("checkpoint.json checkpoint_id does not match its content")
+    if report.get("checkpoint_id") != manifest.get("checkpoint_id"):
+        errors.append("privacy report checkpoint_id does not match checkpoint.json")
+    if report.get("audience") != audience:
+        errors.append("privacy report audience does not match checkpoint.json")
+
+    coverage_metrics = checkpoint_coverage_metrics(root, manifest)
+    coverage = manifest.get("coverage", {})
+    for key, value in coverage_metrics.items():
+        if coverage.get(key) != value:
+            errors.append(f"checkpoint.json coverage {key} does not match the bundle")
+    if coverage_metrics["retention_ratio"] < CHECKPOINT_MIN_KNOWLEDGE_RETENTION_RATIO:
+        errors.append("project-knowledge.md is too thin for comprehensive mode")
+    if report.get("coverage") != coverage_metrics:
+        errors.append("privacy report coverage metrics do not match the bundle")
+
+    actual_content_files = checkpoint_content_file_hashes(root)
+    if manifest.get("files") != actual_content_files:
+        errors.append("checkpoint.json generated-file hashes do not match the bundle")
+    findings, scanned_files = scan_checkpoint_bundle(root, audience) if audience in CHECKPOINT_AUDIENCES else ([], [])
+    if report.get("files") != scanned_files:
+        errors.append("privacy report file hashes do not match the bundle")
+    report_finding_ids = {
+        item.get("id") for item in report.get("findings", []) if isinstance(item, dict)
+    }
+    actual_finding_ids = {finding.finding_id for finding in findings}
+    if report_finding_ids != actual_finding_ids:
+        errors.append("privacy findings do not match a fresh scan")
+    override_rows = report.get("overrides")
+    if not isinstance(override_rows, list):
+        errors.append("privacy report overrides must be an array")
+        override_rows = []
+    override_ids: set[str] = set()
+    for index, item in enumerate(override_rows):
+        if not isinstance(item, dict) or not isinstance(item.get("finding_id"), str):
+            errors.append(f"privacy report override {index + 1} is invalid")
+            continue
+        try:
+            validate_override_reason(item.get("reason"))
+        except SystemExit:
+            errors.append(f"privacy report override {index + 1} has an invalid reason")
+            continue
+        override_ids.add(item["finding_id"])
+    if len(override_ids) != len(override_rows):
+        errors.append("privacy report overrides contain duplicate or invalid finding IDs")
+    if not override_ids.issubset(actual_finding_ids):
+        errors.append("privacy report contains an unknown or stale override")
+    expected_finding_records = [
+        checkpoint_finding_json(finding, finding.finding_id in override_ids)
+        for finding in findings
+    ]
+    if report.get("findings") != expected_finding_records:
+        errors.append("privacy report finding metadata does not match a fresh scan")
+    blocking_ids = actual_finding_ids - override_ids
+    source_override_count = len(manifest.get("source_overrides", []))
+    if report.get("source_override_count") != source_override_count:
+        errors.append("privacy report source override count does not match checkpoint.json")
+    expected_status = "blocked" if blocking_ids else (
+        "overridden" if actual_finding_ids or source_override_count else "passed"
+    )
+    if report.get("status") != expected_status:
+        errors.append("privacy report status does not match the current findings")
+    result = {
+        "schema": CHECKPOINT_PRIVACY_SCHEMA,
+        "status": "invalid" if errors else expected_status,
+        "checkpoint_id": manifest.get("checkpoint_id"),
+        "audience": audience,
+        "file_count": len(scanned_files),
+        "finding_count": len(findings),
+        "override_count": len(override_ids),
+        "source_override_count": source_override_count,
+        "coverage": coverage_metrics,
+        "finding_categories": sorted({finding.category for finding in findings}),
+        "errors": errors,
+    }
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(
+            f"Checkpoint verify: {result['status']} ({result['file_count']} files, "
+            f"{result['finding_count']} findings, {result['override_count']} overrides)"
+        )
+        for error in errors:
+            print(f"- {error}")
+    return 2 if errors or expected_status == "blocked" else 0
+
+
+def run_checkpoint(args: argparse.Namespace) -> int:
+    handlers = {"seal": checkpoint_seal, "verify": checkpoint_verify}
+    return handlers[args.checkpoint_command](args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="llm-wiki",
@@ -2195,6 +5330,275 @@ def build_parser() -> argparse.ArgumentParser:
     schema_adopt_parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="Print JSON.")
 
     schema.set_defaults(func=run_schema)
+
+    retract = subparsers.add_parser(
+        "retract",
+        help="Remove a value from wiki-controlled local files.",
+        description=(
+            "Find a value and common encoded forms without placing the value in command "
+            "arguments. Dry-run is the default; pass --apply to rewrite matched text, "
+            "rename matched paths, and verify the selected local scope."
+        ),
+    )
+    retract.add_argument("path", nargs="?", help="Wiki root path to scan.")
+    retract.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Read the exact value from standard input instead of a hidden prompt.",
+    )
+    retract.add_argument("--apply", action="store_true", help="Apply changes and verify again.")
+    retract.add_argument("--local", action="store_true", help="Target .wiki/ in the current directory.")
+    retract.add_argument("--wiki", help="Target a named wiki, including an archived wiki.")
+    retract.add_argument("--hub", help="Override hub path resolution.")
+    retract.add_argument(
+        "--everywhere",
+        action="store_true",
+        help="Scan the hub, registered wiki roots, archives, sessions, and current .wiki/.",
+    )
+    retract.add_argument(
+        "--variants",
+        choices=["exact", "common"],
+        default="common",
+        help="Match exact bytes only or also common JSON, URL, base64, and hex forms.",
+    )
+    retract.add_argument(
+        "--delete-binary-matches",
+        action="store_true",
+        help="Delete whole binary files containing a match; otherwise report them as unresolved.",
+    )
+    retract.add_argument("--json", action="store_true", help="Print a machine-readable report.")
+    retract.set_defaults(func=run_retract)
+
+    specialist = subparsers.add_parser(
+        "specialist",
+        help="Manage personal, instruction-only specialist skills in the local hub.",
+        description=(
+            "Create and validate Agent Skills-compatible specialist methods under "
+            "HUB/.skills, then explicitly enable them per active topic. Specialists "
+            "never grant tools or professional authority."
+        ),
+    )
+    specialist.add_argument("--hub", help="Override hub path for specialist operations.")
+    specialist_sub = specialist.add_subparsers(dest="specialist_command", required=True)
+
+    specialist_init_parser = specialist_sub.add_parser(
+        "init", help="Initialize HUB/.skills without creating a specialist."
+    )
+    specialist_init_parser.add_argument(
+        "--hub", default=argparse.SUPPRESS, help="Override hub path."
+    )
+    specialist_init_parser.add_argument(
+        "--json", action="store_true", help="Print JSON."
+    )
+
+    specialist_create_parser = specialist_sub.add_parser(
+        "create", help="Create an instruction-only specialist SKILL.md scaffold."
+    )
+    specialist_create_parser.add_argument("name", help="Stable lowercase specialist name.")
+    specialist_create_parser.add_argument(
+        "--description", required=True, help="Specific selection description, up to 1024 characters."
+    )
+    specialist_create_parser.add_argument(
+        "--risk-tier",
+        choices=sorted(SPECIALIST_RISK_TIERS),
+        default="medium",
+        help="Declared review risk tier (default: medium).",
+    )
+    specialist_create_parser.add_argument(
+        "--hub", default=argparse.SUPPRESS, help="Override hub path."
+    )
+    specialist_create_parser.add_argument(
+        "--json", action="store_true", help="Print JSON."
+    )
+
+    specialist_refresh_parser = specialist_sub.add_parser(
+        "refresh", help="Rebuild .skills/_index.md after editing specialist files."
+    )
+    specialist_refresh_parser.add_argument(
+        "--hub", default=argparse.SUPPRESS, help="Override hub path."
+    )
+    specialist_refresh_parser.add_argument(
+        "--json", action="store_true", help="Print JSON."
+    )
+
+    specialist_list_parser = specialist_sub.add_parser(
+        "list", help="List all specialists or the allowlist for one topic."
+    )
+    specialist_list_parser.add_argument(
+        "--wiki", help="Show only specialists enabled for this active topic."
+    )
+    specialist_list_parser.add_argument(
+        "--hub", default=argparse.SUPPRESS, help="Override hub path."
+    )
+    specialist_list_parser.add_argument(
+        "--json", action="store_true", help="Print JSON."
+    )
+
+    specialist_show_parser = specialist_sub.add_parser(
+        "show", help="Print one specialist SKILL.md and its metadata."
+    )
+    specialist_show_parser.add_argument("name", help="Specialist name.")
+    specialist_show_parser.add_argument(
+        "--hub", default=argparse.SUPPRESS, help="Override hub path."
+    )
+    specialist_show_parser.add_argument(
+        "--json", action="store_true", help="Print JSON including the instruction body."
+    )
+
+    specialist_validate_parser = specialist_sub.add_parser(
+        "validate", help="Validate the library or one specialist package."
+    )
+    specialist_validate_parser.add_argument("name", nargs="?", help="Optional specialist name.")
+    specialist_validate_parser.add_argument(
+        "--hub", default=argparse.SUPPRESS, help="Override hub path."
+    )
+    specialist_validate_parser.add_argument(
+        "--json", action="store_true", help="Print JSON."
+    )
+
+    for action, help_text in [
+        ("enable", "Allow one valid specialist for an active topic."),
+        ("disable", "Remove one specialist from an active topic allowlist."),
+    ]:
+        action_parser = specialist_sub.add_parser(action, help=help_text)
+        action_parser.add_argument("name", help="Specialist name.")
+        action_parser.add_argument("--wiki", required=True, help="Active topic slug.")
+        action_parser.add_argument(
+            "--hub", default=argparse.SUPPRESS, help="Override hub path."
+        )
+        action_parser.add_argument("--json", action="store_true", help="Print JSON.")
+
+    specialist.set_defaults(func=run_specialist)
+
+    adapter = subparsers.add_parser(
+        "adapter",
+        help="Register and run explicitly trusted local private adapters.",
+        description=(
+            "Manage the machine-local private-adapter registry. Adapter code and "
+            "credentials stay outside the wiki; successful runs return verified "
+            "artifacts but never import them automatically."
+        ),
+    )
+    adapter_sub = adapter.add_subparsers(dest="adapter_command", required=True)
+
+    adapter_add_parser = adapter_sub.add_parser(
+        "add", help="Register an adapter from an existing local checkout."
+    )
+    adapter_add_parser.add_argument("path", help="Local adapter root containing .llm-wiki-adapter.json.")
+    adapter_add_parser.add_argument(
+        "--read-root", action="append", default=[], help="Allowed adapter input root; repeatable."
+    )
+    adapter_add_parser.add_argument(
+        "--write-root", action="append", default=[], help="Allowed adapter output root; repeatable."
+    )
+    adapter_add_parser.add_argument(
+        "--env", action="append", default=[], help="Environment variable name to pass without storing its value; repeatable."
+    )
+    adapter_add_parser.add_argument(
+        "--remote-resource", action="append", default=[],
+        help="Exact remote resource identifier allowed for this adapter; repeatable."
+    )
+    adapter_add_parser.add_argument(
+        "--replace", action="store_true", help="Replace an existing registration with the same id."
+    )
+    adapter_add_parser.add_argument("--json", action="store_true", help="Print JSON.")
+
+    adapter_list_parser = adapter_sub.add_parser("list", help="List registered adapters.")
+    adapter_list_parser.add_argument("--json", action="store_true", help="Print JSON.")
+
+    adapter_show_parser = adapter_sub.add_parser("show", help="Show one registration.")
+    adapter_show_parser.add_argument("adapter_id", help="Registered adapter id.")
+
+    adapter_route_parser = adapter_sub.add_parser(
+        "route", help="Match an intent and resource against registered adapter routes."
+    )
+    adapter_route_parser.add_argument(
+        "--intent", required=True, help="Lowercase requested-effect token."
+    )
+    adapter_route_parser.add_argument(
+        "--resource", required=True, help="External resource URL to classify."
+    )
+    adapter_route_parser.add_argument("--json", action="store_true", help="Print JSON.")
+
+    adapter_doctor_parser = adapter_sub.add_parser(
+        "doctor", help="Validate a registration and perform the describe handshake."
+    )
+    adapter_doctor_parser.add_argument("adapter_id", help="Registered adapter id.")
+    adapter_doctor_parser.add_argument(
+        "--timeout", type=int, default=30, help="Handshake timeout in seconds."
+    )
+    adapter_doctor_parser.add_argument("--json", action="store_true", help="Print JSON.")
+
+    adapter_run_parser = adapter_sub.add_parser(
+        "run", help="Execute a registered operation from a JSON request."
+    )
+    adapter_run_parser.add_argument("adapter_id", help="Registered adapter id.")
+    adapter_run_parser.add_argument("--request", required=True, help="Absolute path to the v1 request JSON.")
+    adapter_run_parser.add_argument(
+        "--response", help="Optional path where the validated response receipt is copied."
+    )
+    adapter_run_parser.add_argument(
+        "--timeout", type=int, default=3600, help="Execution timeout in seconds."
+    )
+    adapter_run_parser.add_argument(
+        "--approve-remote-write",
+        metavar="PLAN_SHA256",
+        help="Explicitly approve a remote-write operation for this exact plan hash."
+    )
+    adapter_run_parser.add_argument("--json", action="store_true", help="Print JSON.")
+
+    adapter_remove_parser = adapter_sub.add_parser("remove", help="Remove a local registration.")
+    adapter_remove_parser.add_argument("adapter_id", help="Registered adapter id.")
+    adapter_remove_parser.add_argument("--yes", action="store_true", help="Confirm removal.")
+    adapter_remove_parser.add_argument("--json", action="store_true", help="Print JSON.")
+
+    adapter.set_defaults(func=run_adapter)
+
+    checkpoint = subparsers.add_parser(
+        "checkpoint",
+        help="Seal and verify exported Project Knowledge Checkpoints.",
+        description=(
+            "Deterministically validate, hash, privacy-scan, seal, and verify a "
+            "Project Knowledge Checkpoint generated by the agentic wiki workflow."
+        ),
+    )
+    checkpoint_sub = checkpoint.add_subparsers(dest="checkpoint_command", required=True)
+
+    checkpoint_seal_parser = checkpoint_sub.add_parser(
+        "seal", help="Finalize hashes and run the mandatory privacy scan."
+    )
+    checkpoint_seal_parser.add_argument("path", help="Checkpoint bundle directory.")
+    checkpoint_seal_parser.add_argument(
+        "--audience",
+        required=True,
+        choices=sorted(CHECKPOINT_AUDIENCES),
+        help="Declared recipient boundary for source-access validation.",
+    )
+    checkpoint_seal_parser.add_argument(
+        "--allow-finding",
+        action="append",
+        default=[],
+        help="Explicitly acknowledge one exact finding ID; repeatable.",
+    )
+    checkpoint_seal_parser.add_argument(
+        "--allow-source",
+        action="append",
+        default=[],
+        help="Explicitly retain one exact wiki:path input above the audience; repeatable.",
+    )
+    checkpoint_seal_parser.add_argument(
+        "--override-reason",
+        help="One-line reason required for any source or finding override.",
+    )
+    checkpoint_seal_parser.add_argument("--json", action="store_true", help="Print JSON.")
+
+    checkpoint_verify_parser = checkpoint_sub.add_parser(
+        "verify", help="Recheck bundle structure, hashes, and privacy attestation."
+    )
+    checkpoint_verify_parser.add_argument("path", help="Checkpoint bundle directory.")
+    checkpoint_verify_parser.add_argument("--json", action="store_true", help="Print JSON.")
+
+    checkpoint.set_defaults(func=run_checkpoint)
 
     return parser
 
