@@ -922,3 +922,43 @@ MIT License. Copyright (c) 2026 nvk.
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files, to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, subject to the following conditions: the above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+## Circuit Breaker
+
+Protect downstream services with Resilience4j.
+
+### Example
+```java
+@CircuitBreaker(name = "payment", fallbackMethod = "paymentFallback")
+public PaymentResult processPayment(Order order) {
+    return paymentClient.charge(order);
+}
+
+public PaymentResult paymentFallback(Order order, Exception e) {
+    log.warn("Payment down, queueing for retry: {}", e.getMessage());
+    paymentRetryQueue.enqueue(order);
+    return PaymentResult.pending();
+}
+```
+
+### Configuration
+```yaml
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-size: 20
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 5
+    instances:
+      payment:
+        base-config: default
+      search:
+        sliding-window-size: 50
+        failure-rate-threshold: 30
+```
+
+### States
+Closed → Open (50% failure) → Half-Open → Closed (success) or Open (failure)
