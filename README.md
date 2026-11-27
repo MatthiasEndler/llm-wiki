@@ -962,3 +962,10 @@ resilience4j:
 
 ### States
 Closed → Open (50% failure) → Half-Open → Closed (success) or Open (failure)
+
+
+## Where To Ask
+- Confirmed bugs → Issues
+- Feature ideas, help and general discussion → Discussions
+## License
+[![License-MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
